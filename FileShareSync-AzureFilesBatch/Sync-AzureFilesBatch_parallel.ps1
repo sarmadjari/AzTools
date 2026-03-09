@@ -25,9 +25,6 @@
     .\Sync-AzureFilesBatch_parallel.ps1 -CsvPath ".\resources.csv" -MaxConcurrentJobs 10
 
 .NOTES
-    Author  : Sarmad Jari
-    Version : 1.0
-    Date    : 2026-03-09
     License : MIT License (https://opensource.org/licenses/MIT)
 
     DISCLAIMER

@@ -2,8 +2,6 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
-**Author:** Sarmad Jari | **Version:** 1.0 | **Date:** 2026-03-09
-
 Batch cross-region DR sync for Azure File Shares using AzCopy v10. Reads a CSV of source and destination storage account ARM Resource IDs and syncs all file shares, preserving SMB/NTFS permissions and directory structures.
 
 ---
