@@ -1,49 +1,33 @@
 <#
 .SYNOPSIS
-    Creates DR blob storage accounts with matching containers from source accounts.
+    Creates DR file share storage accounts and copies file shares from source accounts.
 
 .DESCRIPTION
     Reads a CSV of source storage account ARM Resource IDs with destination account names
     and resource group names. Creates matching storage accounts in a target region,
-    replicating source configuration (kind, SKU, HNS, TLS, access tier, networking).
-    Creates all blob containers from source on destination. Optionally configures
-    Object Replication (versioning, change feed, replication policies with monitoring enabled).
+    replicating source configuration (kind, SKU, TLS, access tier, networking).
+    Lists all file shares from source and creates matching shares on destination
+    (replicating quota and access tier). Then copies data using AzCopy server-side
+    (S2S) copy, preserving SMB/NTFS permissions and directory structures.
 
-    Compatible storage account types (for account creation):
-      - StorageV2 (General Purpose v2) — most common
-      - BlobStorage (legacy blob-only)
-      - BlockBlobStorage (Premium block blob)
-      - FileStorage (Premium file shares)
-      - StorageV2 with HNS enabled (ADLS Gen2 / Data Lake)
-
-    Object Replication compatibility (when using -ConfigureObjectReplication):
-      - Supported: StorageV2 (General Purpose v2), BlobStorage (legacy), BlockBlobStorage (Premium)
-      - NOT supported: Accounts with Hierarchical Namespace (HNS/ADLS Gen2), FileStorage
-      - Incompatible account types are automatically SKIPPED (not failed) — the storage
-        account and containers are still created, only the replication step is skipped
-        with a warning logged.
-      - For compatible accounts only, the script automatically enables the required
-        prerequisites before creating the replication policy:
-          * Blob versioning on BOTH source and destination (required by Azure)
-          * Change feed on source (required by Azure)
-        Incompatible accounts are skipped entirely — no changes are made to them.
-      - The script then configures BOTH accounts in two steps:
-        1. Creates the policy on the DESTINATION account first (Azure requirement)
-        2. Applies the same policy ID to the SOURCE account
-        Both steps are required — if only the destination has the policy,
-        replication will NOT start. The source needs the policy so Azure knows
-        to watch for changes and replicate blobs to the destination.
+    The script replicates whatever kind and SKU the source account has (StorageV2,
+    FileStorage, etc.). If the source account has 0 file shares, the account and
+    resource group are still created — only the share creation and data copy steps
+    are skipped.
 
     If the destination resource group does not exist, it is created automatically
     in the destination region.
 
-    Networking (firewall) is applied LAST — after containers and Object Replication
-    are configured — to avoid blocking container creation on the destination.
+    Networking (firewall) is applied LAST — after shares are created and data is
+    copied — to avoid blocking operations on the destination. For source accounts
+    with firewall restrictions, the script temporarily opens the source firewall
+    for AzCopy, then restores the original settings.
 
     The script is idempotent — safe to re-run:
-      - Existing storage accounts are skipped (not recreated), but new containers are synced.
-      - Existing containers on the destination are not affected.
-      - -ConfigureObjectReplication can be run separately after initial creation.
+      - Existing storage accounts are skipped (not recreated), but new shares are synced.
+      - Existing shares on the destination are not affected.
+      - For existing accounts with firewall restrictions, the firewall is automatically
+        opened temporarily, data is synced, and the original settings are restored.
 
     Pre-validation: All rows are validated BEFORE any Azure operations begin.
     Invalid names, duplicate names, and malformed ARM Resource IDs are reported
@@ -58,49 +42,25 @@
 .PARAMETER DestSubscriptionId
     Optional. Subscription for destination accounts. Defaults to source subscription.
 
-.PARAMETER SyncContainers
-    Switch. For already-existing destination accounts that have firewall restrictions,
-    temporarily opens the firewall, syncs missing containers from source, then
-    re-applies the original networking settings. Use this to add containers to
-    accounts that were created in a previous run.
-
-.PARAMETER ConfigureObjectReplication
-    Switch. Enables blob versioning on both accounts, change feed on source,
-    and creates object replication policies per container with replication
-    monitoring enabled (metrics and per-rule status tracking in Azure Monitor).
-    Can be run independently after initial account creation.
-
 .PARAMETER DryRun
     Switch. Dry run — shows what would be created without making changes.
 
 .EXAMPLE
-    # Create DR accounts in switzerlandnorth, same subscription as source
-    ./Create-DRBlobStorageAccounts.ps1 -CsvPath "./resources.csv" -DestRegion "switzerlandnorth"
+    # Create DR accounts with file share copy
+    ./Create-DRFileShareAccounts.ps1 -CsvPath "./resources.csv" -DestRegion "switzerlandnorth"
 
 .EXAMPLE
-    # Create in a different subscription
-    ./Create-DRBlobStorageAccounts.ps1 -CsvPath "./resources.csv" -DestRegion "switzerlandnorth" -DestSubscriptionId "xxx-yyy"
+    # Dry run (preview changes without creating anything)
+    ./Create-DRFileShareAccounts.ps1 -CsvPath "./resources.csv" -DestRegion "switzerlandnorth" -DryRun
 
 .EXAMPLE
-    # Dry run
-    ./Create-DRBlobStorageAccounts.ps1 -CsvPath "./resources.csv" -DestRegion "switzerlandnorth" -DryRun
-
-.EXAMPLE
-    # With Object Replication
-    ./Create-DRBlobStorageAccounts.ps1 -CsvPath "./resources.csv" -DestRegion "switzerlandnorth" -ConfigureObjectReplication
-
-.EXAMPLE
-    # Re-run later to sync containers on already-created accounts with firewall restrictions
-    ./Create-DRBlobStorageAccounts.ps1 -CsvPath "./resources.csv" -DestRegion "switzerlandnorth" -SyncContainers
-
-.EXAMPLE
-    # Combine: sync containers + configure Object Replication on existing accounts
-    ./Create-DRBlobStorageAccounts.ps1 -CsvPath "./resources.csv" -DestRegion "switzerlandnorth" -SyncContainers -ConfigureObjectReplication
+    # Create DR accounts in a different subscription
+    ./Create-DRFileShareAccounts.ps1 -CsvPath "./resources.csv" -DestRegion "switzerlandnorth" -DestSubscriptionId "xxx-yyy"
 
 .NOTES
     Author  : Sarmad Jari
-    Version : 2.4
-    Date    : 2026-03-09
+    Version : 1.0
+    Date    : 2026-03-10
     License : MIT License (https://opensource.org/licenses/MIT)
 
     DISCLAIMER
@@ -119,15 +79,15 @@
 
     By using this script, you accept full responsibility for:
       - Reviewing and customising the script to meet your specific environment
-      - Validating storage account naming, SKU selections, and replication policies
+      - Validating storage account naming, SKU selections, and file share quotas
         against your organisational standards
       - Applying appropriate security hardening, access controls, network restrictions,
         and compliance policies to all storage accounts in both source and destination regions
       - Ensuring data residency, sovereignty, and regulatory requirements are met
-        for the target region before executing any replication
+        for the target region before executing any data copy
       - Testing in lower environments (development / staging) before running against
         production storage accounts
-      - Verifying replication policies, RPO targets, and failover procedures are fit
+      - Verifying data copy completeness, RPO targets, and failover procedures are fit
         for purpose prior to production use
       - Following your organisation's approved change management, deployment, and
         operational practices
@@ -140,13 +100,14 @@ param (
     [Parameter(Mandatory=$true)][string]$CsvPath,
     [Parameter(Mandatory=$true)][string]$DestRegion,
     [Parameter(Mandatory=$false)][string]$DestSubscriptionId,
-    [switch]$SyncContainers,
-    [switch]$ConfigureObjectReplication,
     [switch]$DryRun
 )
 
 $ErrorActionPreference = "Stop"
 $ScriptStartTime = Get-Date
+
+# Disable AzCopy auto-login to prevent SAS URL parser corruption
+$env:AZCOPY_AUTO_LOGIN_TYPE = "NONE"
 
 # ── Shared Functions ─────────────────────────────────────────────
 
@@ -154,7 +115,7 @@ function Write-Log {
     param(
         [string]$Message,
         [string]$Level = "INFO",
-        [string]$Progress = ""
+        [string]$Progress
     )
     $Timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ssZ"
     $Color = switch ($Level) {
@@ -188,11 +149,9 @@ function Validate-StorageAccountName {
         $Errors += "Name must be 3-24 characters (got $($Name.Length))"
     }
     if ($Name -notmatch "^[a-z0-9]+$") {
-        $Errors += "Name must be lowercase alphanumeric only"
+        $Errors += "Name must contain only lowercase letters and numbers"
     }
-    if ($Errors.Count -gt 0) {
-        return $Errors -join "; "
-    }
+    if ($Errors.Count -gt 0) { return ($Errors -join "; ") }
     return $null
 }
 
@@ -216,20 +175,17 @@ function Get-AzErrorDetail {
     if ($Combined -match "(?i)RequestDisallowedByPolicy|PolicyViolation|policy") {
         $PolicyInfo = "AZURE POLICY VIOLATION: "
 
-        # Try to extract the policy name/display name
         if ($Combined -match '"policyDefinitionDisplayName"\s*:\s*"([^"]+)"') {
             $PolicyInfo += "Policy='$($Matches[1])' "
         }
         if ($Combined -match '"policyAssignmentDisplayName"\s*:\s*"([^"]+)"') {
             $PolicyInfo += "Assignment='$($Matches[1])' "
         }
-        # Capture the message
         if ($Combined -match '"message"\s*:\s*"([^"]+)"') {
             $PolicyInfo += "Message='$($Matches[1])'"
         }
 
         if ($PolicyInfo -eq "AZURE POLICY VIOLATION: ") {
-            # Fallback: capture any useful policy text
             if ($Combined -match "(?i)(policy[^`"\n]{0,200})") {
                 $PolicyInfo += $Matches[1].Trim()
             }
@@ -250,10 +206,9 @@ function Get-AzErrorDetail {
         return $Matches[1].Trim()
     }
 
-    # Return the last meaningful line (often the error summary)
+    # Return the last meaningful line
     $Lines = $Combined -split "`n" | Where-Object { $_.Trim() -ne "" }
     if ($Lines.Count -gt 0) {
-        # Return last non-empty line, truncated
         $LastLine = $Lines[-1].Trim()
         if ($LastLine.Length -gt 500) { $LastLine = $LastLine.Substring(0, 500) + "..." }
         return $LastLine
@@ -319,10 +274,10 @@ function ConvertTo-TagArgs {
     return $TagArgs
 }
 
-function Open-DestFirewall {
+function Open-StorageFirewall {
     <#
     .SYNOPSIS
-        Temporarily opens the destination account firewall for container operations.
+        Temporarily opens a storage account firewall for data operations.
         Returns the original settings so they can be restored later.
     #>
     param(
@@ -341,7 +296,7 @@ function Open-DestFirewall {
 
     # Only open if currently restricted
     if ($OriginalSettings.DefaultAction -eq "Deny" -or $OriginalSettings.PublicAccess -eq "Disabled") {
-        Write-Log "    Temporarily opening firewall on '$AccountName' for container operations..."
+        Write-Log "    Temporarily opening firewall on '$AccountName' for data operations..."
 
         # Enable public access if disabled
         if ($OriginalSettings.PublicAccess -eq "Disabled") {
@@ -358,10 +313,10 @@ function Open-DestFirewall {
     return $OriginalSettings
 }
 
-function Restore-DestFirewall {
+function Restore-StorageFirewall {
     <#
     .SYNOPSIS
-        Restores the destination account firewall to its original settings.
+        Restores a storage account firewall to its original settings.
     #>
     param(
         [string]$AccountName,
@@ -391,9 +346,6 @@ function Format-Duration {
         return "{0:N0}s" -f [math]::Floor($Duration.TotalSeconds)
     }
 }
-
-# ── System containers to skip ────────────────────────────────────
-$SystemContainers = @('$logs', '$blobchangefeed', '$web', '$root', 'azure-webjobs-hosts', 'azure-webjobs-secrets')
 
 try {
     # ── Validate inputs ──────────────────────────────────────────
@@ -434,7 +386,7 @@ try {
 
     for ($i = 0; $i -lt $TotalRows; $i++) {
         $Row = $AccountList[$i]
-        $CsvRowNum = $i + 1  # 1-based for display (matches CSV line number if 1 header line)
+        $CsvRowNum = $i + 1  # 1-based for display
 
         # --- Validate ARM Resource ID ---
         $ArmId = $Row.SourceResourceId.Trim()
@@ -512,14 +464,6 @@ try {
         Write-Log "============================================" "DRYRUN"
     }
 
-    if ($SyncContainers) {
-        Write-Log "============================================"
-        Write-Log "  SYNC CONTAINERS MODE -- will temporarily"
-        Write-Log "  open firewall on existing accounts to"
-        Write-Log "  create missing containers, then restore."
-        Write-Log "============================================"
-    }
-
     # ── Results tracking ─────────────────────────────────────────
     $Results = @()
     $RowNum = 0
@@ -527,7 +471,8 @@ try {
     $AccountsExisted = 0
     $AccountsSkipped = 0
     $AccountsFailed = 0
-    $TotalContainersCreated = 0
+    $TotalSharesCreated = 0
+    $TotalSharesCopied = 0
 
     # ── Track resource groups already ensured ─────────────────────
     $EnsuredResourceGroups = @{}
@@ -539,6 +484,14 @@ try {
         $RowNum++
         $RowStartTime = Get-Date
         $Progress = "$RowNum/$TotalRows"
+
+        # Reset per-row variables
+        $Source = $null
+        $DestAccountName = $null
+        $DestRGName = $null
+        $DestSubId = $null
+        $OriginalDestNetworkSettings = $null
+        $OriginalSourceNetworkSettings = $null
 
         try {
             # 1. Parse source ARM Resource ID
@@ -566,17 +519,16 @@ try {
                     DestRegion         = $DestRegion
                     DestSubscription   = $DestSubId
                     AccountStatus      = "Skipped"
-                    ContainersCreated  = 0
-                    ContainersSkipped  = 0
+                    SharesCreated      = 0
+                    SharesCopied       = 0
                     NetworkingConfig   = ""
-                    ObjectReplication  = ""
                     Notes              = $NameError
                 }
                 $AccountsSkipped++
                 continue
             }
 
-            # 3. Validate source exists and read properties
+            # 3. Read source properties
             Write-Log "  Reading source properties: $($Source.AccountName)..." "" $Progress
             az account set --subscription $Source.SubscriptionId | Out-Null
             $SourcePropsJson = az storage account show --name $Source.AccountName --resource-group $Source.ResourceGroup -o json 2>$null
@@ -651,12 +603,12 @@ try {
                 $EnsuredResourceGroups[$RGKey] = $true
             }
 
-            # 6. Check if destination storage account already exists
-            $DestExists = az storage account show --name $DestAccountName --resource-group $DestRGName --query "name" -o tsv 2>$null
+            # 6. Check if destination storage account already exists (includes network props for firewall auto-detect)
+            $DestCheckJson = az storage account show --name $DestAccountName --resource-group $DestRGName --query "{name:name, defaultAction:networkRuleSet.defaultAction, publicNetworkAccess:publicNetworkAccess}" -o json 2>$null
             $AccountCreatedThisRun = $false
-            $OriginalNetworkSettings = $null
 
-            if ($DestExists) {
+            if ($DestCheckJson) {
+                $DestCheckProps = $DestCheckJson | ConvertFrom-Json
                 Write-Log "  Destination account '$DestAccountName' already exists. Skipping creation." "" $Progress
                 $AccountStatus = "AlreadyExists"
                 $AccountsExisted++
@@ -670,11 +622,17 @@ try {
                     Write-Log "  [DRYRUN] Would update storage account tags ($SourceAccountTagCount tag(s))" "DRYRUN" $Progress
                 }
 
-                # If -SyncContainers, temporarily open the firewall for container operations
-                if ($SyncContainers -and -not $DryRun) {
-                    $OriginalNetworkSettings = Open-DestFirewall -AccountName $DestAccountName -ResourceGroup $DestRGName
-                } elseif ($SyncContainers -and $DryRun) {
-                    Write-Log "  [DRYRUN] Would temporarily open firewall for container sync" "DRYRUN" $Progress
+                # Auto-detect: if dest has restrictive firewall, temporarily open it for data operations
+                $DestDefaultAction = if ($DestCheckProps.defaultAction) { $DestCheckProps.defaultAction } else { "Allow" }
+                $DestPublicAccess  = if ($DestCheckProps.publicNetworkAccess) { $DestCheckProps.publicNetworkAccess } else { "Enabled" }
+
+                if ($DestDefaultAction -eq "Deny" -or $DestPublicAccess -eq "Disabled") {
+                    if (-not $DryRun) {
+                        Write-Log "  Existing account has restrictive firewall (defaultAction=$DestDefaultAction, publicAccess=$DestPublicAccess). Temporarily opening..." "" $Progress
+                        $OriginalDestNetworkSettings = Open-StorageFirewall -AccountName $DestAccountName -ResourceGroup $DestRGName
+                    } else {
+                        Write-Log "  [DRYRUN] Would temporarily open dest firewall (defaultAction=$DestDefaultAction, publicAccess=$DestPublicAccess)" "DRYRUN" $Progress
+                    }
                 }
             } else {
                 # Build create command arguments — account is created with default open networking
@@ -686,10 +644,14 @@ try {
                     "--kind", $SourceKind,
                     "--sku", $SourceSku,
                     "--min-tls-version", $SourceTls,
-                    "--access-tier", $SourceAccessTier,
                     "--allow-blob-public-access", $SourceAllowBlobPublicAccess.ToString().ToLower(),
                     "-o", "none"
                 )
+
+                # Access tier only for non-FileStorage accounts (FileStorage does not support --access-tier)
+                if ($SourceKind -ne "FileStorage") {
+                    $CreateArgs += @("--access-tier", $SourceAccessTier)
+                }
 
                 if ($SourceHns) {
                     $CreateArgs += @("--hns", "true")
@@ -719,208 +681,161 @@ try {
                 }
             }
 
-            # 7. List source containers via Management Plane API
-            #    Uses ARM API instead of data plane — bypasses storage firewall (defaultAction=Deny)
-            Write-Log "  Listing containers on source '$($Source.AccountName)' (via ARM)..." "" $Progress
+            # 7. List source file shares via ARM API (bypasses source firewall)
+            Write-Log "  Listing file shares on source '$($Source.AccountName)' (via ARM)..." "" $Progress
             az account set --subscription $Source.SubscriptionId | Out-Null
 
-            $ArmContainersUrl = "https://management.azure.com/subscriptions/$($Source.SubscriptionId)/resourceGroups/$($Source.ResourceGroup)/providers/Microsoft.Storage/storageAccounts/$($Source.AccountName)/blobServices/default/containers?api-version=2023-05-01"
-            $ArmContainersJson = az rest --method GET --url $ArmContainersUrl -o json 2>$null
+            $ArmSharesUrl = "https://management.azure.com/subscriptions/$($Source.SubscriptionId)/resourceGroups/$($Source.ResourceGroup)/providers/Microsoft.Storage/storageAccounts/$($Source.AccountName)/fileServices/default/shares?api-version=2023-05-01"
+            $ArmSharesJson = az rest --method GET --url $ArmSharesUrl -o json 2>$null
 
-            $AllContainers = @()
-            if ($ArmContainersJson) {
-                $ArmContainersObj = $ArmContainersJson | ConvertFrom-Json
-                $AllContainers = @($ArmContainersObj.value | ForEach-Object { $_.name })
-            }
-
-            if ($AllContainers.Count -eq 0) {
-                Write-Log "  ARM API returned 0 containers. Trying data plane fallback..." "WARN" $Progress
-                $ContainersJson = az storage container list --account-name $Source.AccountName --auth-mode login --query "[].name" -o json 2>$null
-                if (-not $ContainersJson -or $ContainersJson -eq "[]") {
-                    $SourceKey = az storage account keys list -g $Source.ResourceGroup -n $Source.AccountName --query "[0].value" -o tsv 2>$null
-                    if ($SourceKey) {
-                        $ContainersJson = az storage container list --account-name $Source.AccountName --account-key $SourceKey --query "[].name" -o json 2>$null
+            $SourceShares = @()
+            if ($ArmSharesJson) {
+                $ArmSharesObj = $ArmSharesJson | ConvertFrom-Json
+                $SourceShares = @($ArmSharesObj.value | ForEach-Object {
+                    @{
+                        Name       = $_.name
+                        Quota      = $_.properties.shareQuota
+                        AccessTier = $_.properties.accessTier
                     }
-                }
-                if ($ContainersJson -and $ContainersJson -ne "[]") {
-                    $AllContainers = @($ContainersJson | ConvertFrom-Json)
-                }
+                })
             }
 
-            # Filter out system containers
-            $UserContainers = $AllContainers | Where-Object {
-                $Name = $_
-                $IsSystem = $false
-                foreach ($Sys in $SystemContainers) {
-                    if ($Name -eq $Sys -or $Name.StartsWith('$')) { $IsSystem = $true; break }
-                }
-                -not $IsSystem
-            }
+            $ShareCount = $SourceShares.Count
+            Write-Log "  Found $ShareCount file share(s) on source." "" $Progress
 
-            $ContainerSkipped = $AllContainers.Count - ($UserContainers | Measure-Object).Count
-            $ContainerCount = ($UserContainers | Measure-Object).Count
-            Write-Log "  Found $ContainerCount user container(s), skipped $ContainerSkipped system container(s)." "" $Progress
-
-            # 8. Create containers on destination (firewall is still open at this point)
-            $ContainersCreatedThisRow = 0
-            if ($ContainerCount -gt 0) {
+            # 8. Create matching shares on destination via ARM (az storage share-rm create)
+            $SharesCreatedThisRow = 0
+            if ($ShareCount -gt 0) {
                 az account set --subscription $DestSubId | Out-Null
 
-                foreach ($Container in $UserContainers) {
-                    $ContainerName = $Container.ToString().Trim()
+                foreach ($Share in $SourceShares) {
+                    $ShareName = $Share.Name
+                    $ShareQuota = $Share.Quota
 
                     if ($DryRun) {
-                        Write-Log "    [DRYRUN] Would create container: $ContainerName" "DRYRUN" $Progress
-                        $ContainersCreatedThisRow++
+                        Write-Log "    [DRYRUN] Would create share: $ShareName (quota=${ShareQuota}GB)" "DRYRUN" $Progress
+                        $SharesCreatedThisRow++
                     } else {
-                        az storage container create --name $ContainerName --account-name $DestAccountName --auth-mode login -o none 2>$null
-                        if ($LASTEXITCODE -ne 0) {
-                            # Fallback to account key
-                            $DestKey = az storage account keys list -g $DestRGName -n $DestAccountName --query "[0].value" -o tsv 2>$null
-                            if ($DestKey) {
-                                az storage container create --name $ContainerName --account-name $DestAccountName --account-key $DestKey -o none 2>$null
-                            }
+                        $ShareCreateArgs = @(
+                            "storage", "share-rm", "create",
+                            "--storage-account", $DestAccountName,
+                            "--resource-group", $DestRGName,
+                            "--name", $ShareName,
+                            "--quota", $ShareQuota.ToString(),
+                            "-o", "none"
+                        )
+
+                        # Access tier only for non-FileStorage (FileStorage shares are always Premium)
+                        if ($SourceKind -ne "FileStorage" -and $Share.AccessTier) {
+                            $ShareCreateArgs += @("--access-tier", $Share.AccessTier)
                         }
-                        $ContainersCreatedThisRow++
-                        $TotalContainersCreated++
-                        Write-Log "    Container created: $ContainerName" "" $Progress
+
+                        Invoke-AzCommand -Arguments $ShareCreateArgs -IgnoreExitCode | Out-Null
+                        Write-Log "    Share created/verified: $ShareName (quota=${ShareQuota}GB)" "" $Progress
+                        $SharesCreatedThisRow++
+                        $TotalSharesCreated++
                     }
                 }
             }
 
-            # 9. Configure Object Replication (if requested) — before locking down networking
-            # Object Replication is only supported on StorageV2, BlobStorage, and BlockBlobStorage without HNS.
-            # Incompatible account types (FileStorage, HNS-enabled) are automatically skipped.
-            $ObjReplStatus = "N/A"
-            if ($ConfigureObjectReplication -and ($SourceKind -notin @("StorageV2", "BlobStorage", "BlockBlobStorage") -or $SourceHns -eq $true)) {
-                $SkipReason = if ($SourceHns -eq $true) { "HNS (ADLS Gen2) is enabled" } else { "account type '$SourceKind'" }
-                Write-Log "  Skipping Object Replication — not compatible: $SkipReason. Only StorageV2, BlobStorage, and BlockBlobStorage without HNS are supported." "WARN" $Progress
-                $ObjReplStatus = "Skipped (incompatible: $SourceKind, HNS=$SourceHns)"
-            } elseif ($ConfigureObjectReplication -and $ContainerCount -eq 0) {
-                Write-Log "  Skipping Object Replication — no user containers to replicate." "WARN" $Progress
-                $ObjReplStatus = "Skipped (no containers)"
-            } elseif ($ConfigureObjectReplication -and -not $DryRun) {
-                Write-Log "  Configuring Object Replication..." "" $Progress
+            # 9. AzCopy server-side (S2S) copy — data transfer
+            $SharesCopiedThisRow = 0
 
-                # --- Prerequisites: Azure requires versioning + change feed BEFORE creating replication policies ---
-                # These are only enabled on compatible accounts (this block is skipped for incompatible types).
-                # No unnecessary changes are made to accounts that cannot use Object Replication.
-                # Replication monitoring (metrics.enabled = true) is set on the policy to unlock
-                # per-rule replication metrics and status tracking in Azure Monitor.
+            if (-not $DryRun -and $ShareCount -gt 0) {
+                Write-Log "  Generating SAS tokens for AzCopy S2S copy..." "" $Progress
 
-                # Enable blob versioning on SOURCE (required for Object Replication)
+                $Expiry = (Get-Date).AddHours(4).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
+
+                # Source SAS (read + list)
                 az account set --subscription $Source.SubscriptionId | Out-Null
-                az storage account blob-service-properties update --account-name $Source.AccountName --resource-group $Source.ResourceGroup --enable-versioning true -o none 2>$null
-                Write-Log "    Versioning enabled on source: $($Source.AccountName)" "" $Progress
+                $SourceKey = (az storage account keys list -g $Source.ResourceGroup -n $Source.AccountName --query "[0].value" -o tsv)
+                if ([string]::IsNullOrWhiteSpace($SourceKey)) {
+                    throw "Failed to retrieve key for source account '$($Source.AccountName)'."
+                }
+                $SourceSasRaw = az storage account generate-sas --account-name $Source.AccountName --account-key $SourceKey --services f --resource-types sco --permissions rl --expiry $Expiry -o tsv
+                $SourceSas = (($SourceSasRaw | Out-String) -replace "[\r\n\s]", "").TrimStart('?')
 
-                # Enable change feed on SOURCE (required for Object Replication)
-                az storage account blob-service-properties update --account-name $Source.AccountName --resource-group $Source.ResourceGroup --enable-change-feed true -o none 2>$null
-                Write-Log "    Change feed enabled on source: $($Source.AccountName)" "" $Progress
-
-                # Enable blob versioning on DESTINATION (required for Object Replication)
+                # Destination SAS (all permissions)
                 az account set --subscription $DestSubId | Out-Null
-                az storage account blob-service-properties update --account-name $DestAccountName --resource-group $DestRGName --enable-versioning true -o none 2>$null
-                Write-Log "    Versioning enabled on destination: $DestAccountName" "" $Progress
-
-                # Build replication rules — one rule per container
-                # minCreationTime = "1601-01-01T00:00:00Z" = replicate ALL blobs (existing + new)
-                # Omitting filters or minCreationTime defaults to "Only new objects" — NOT what we want.
-                $Rules = @()
-                foreach ($Container in $UserContainers) {
-                    $ContainerName = $Container.ToString().Trim()
-                    $Rules += @{
-                        sourceContainer      = $ContainerName
-                        destinationContainer = $ContainerName
-                        filters              = @{
-                            minCreationTime = "1601-01-01T00:00:00Z"
-                        }
-                    }
+                $DestKey = (az storage account keys list -g $DestRGName -n $DestAccountName --query "[0].value" -o tsv)
+                if ([string]::IsNullOrWhiteSpace($DestKey)) {
+                    throw "Failed to retrieve key for destination account '$DestAccountName'."
                 }
+                $DestSasRaw = az storage account generate-sas --account-name $DestAccountName --account-key $DestKey --services f --resource-types sco --permissions acdlrwup --expiry $Expiry -o tsv
+                $DestSas = (($DestSasRaw | Out-String) -replace "[\r\n\s]", "").TrimStart('?')
 
-                $DestAccountArmId = "/subscriptions/$DestSubId/resourceGroups/$DestRGName/providers/Microsoft.Storage/storageAccounts/$DestAccountName"
-
-                # Check if a replication policy already exists between this source-destination pair
-                az account set --subscription $DestSubId | Out-Null
-                $ExistingPoliciesJson = az rest --method GET --url "https://management.azure.com${DestAccountArmId}/objectReplicationPolicies?api-version=2024-01-01" -o json 2>$null
-                $ExistingPolicyId = $null
-
-                if ($ExistingPoliciesJson) {
-                    $ExistingPolicies = ($ExistingPoliciesJson | ConvertFrom-Json).value
-                    foreach ($Pol in $ExistingPolicies) {
-                        $PolSource = $Pol.properties.sourceAccount
-                        # Match by full ARM ID or by account name
-                        if ($PolSource -eq $SourceProps.id -or $PolSource -eq $Source.AccountName) {
-                            $ExistingPolicyId = $Pol.properties.policyId
-                            Write-Log "    Found existing replication policy (ID: $ExistingPolicyId). Will update." "" $Progress
-                            break
-                        }
-                    }
-                }
-
-                # Determine the policy endpoint — use existing ID to update, or 'default' to create new
-                $DestPolicyEndpoint = if ($ExistingPolicyId) {
-                    "https://management.azure.com${DestAccountArmId}/objectReplicationPolicies/${ExistingPolicyId}?api-version=2024-01-01"
-                } else {
-                    "https://management.azure.com${DestAccountArmId}/objectReplicationPolicies/default?api-version=2024-01-01"
-                }
-
-                # Build the policy payload — metrics.enabled unlocks replication monitoring
-                # (per-rule status and lag metrics in Azure Monitor). Requires api-version 2024-01-01+.
-                $PolicyPayload = @{
-                    properties = @{
-                        sourceAccount      = $SourceProps.id
-                        destinationAccount = $DestAccountArmId
-                        rules              = $Rules
-                        metrics            = @{ enabled = $true }
-                    }
-                } | ConvertTo-Json -Depth 10
-
-                $TempFile = [System.IO.Path]::GetTempFileName()
-                $PolicyPayload | Out-File -FilePath $TempFile -Encoding UTF8
-
-                # Create or update the policy on the destination account
-                $PolicyResult = az rest --method PUT --url $DestPolicyEndpoint --body "@$TempFile" -o json 2>$null
-
-                if ($PolicyResult) {
-                    $PolicyObj = $PolicyResult | ConvertFrom-Json
-                    $PolicyId = $PolicyObj.properties.policyId
-                    $ActionVerb = if ($ExistingPolicyId) { "updated" } else { "created" }
-                    Write-Log "    Object Replication policy $ActionVerb on destination (ID: $PolicyId)." "" $Progress
-
-                    # Apply the same policy ID to the source account
-                    $SourcePolicyPayload = @{
-                        properties = @{
-                            sourceAccount      = $SourceProps.id
-                            destinationAccount = $DestAccountArmId
-                            rules              = $Rules
-                            metrics            = @{ enabled = $true }
-                        }
-                    } | ConvertTo-Json -Depth 10
-
-                    $SourcePolicyPayload | Out-File -FilePath $TempFile -Encoding UTF8 -Force
-
+                # Temporarily open source firewall if needed for AzCopy S2S copy
+                if ($SourceDefaultAction -eq "Deny" -or $SourcePublicAccess -eq "Disabled") {
                     az account set --subscription $Source.SubscriptionId | Out-Null
-                    az rest --method PUT --url "https://management.azure.com$($SourceProps.id)/objectReplicationPolicies/$PolicyId`?api-version=2024-01-01" --body "@$TempFile" -o none 2>$null
-                    Write-Log "    Object Replication policy applied to source." "SUCCESS" $Progress
-                    $ObjReplStatus = if ($ExistingPolicyId) { "Updated" } else { "Configured" }
-                } else {
-                    Write-Log "    Failed to create/update Object Replication policy." "WARN" $Progress
-                    $ObjReplStatus = "Failed"
+                    $OriginalSourceNetworkSettings = Open-StorageFirewall -AccountName $Source.AccountName -ResourceGroup $Source.ResourceGroup
                 }
 
-                Remove-Item $TempFile -ErrorAction SilentlyContinue
+                # Clear env var to prevent SAS cross-contamination
+                Remove-Item env:AZURE_STORAGE_SAS_TOKEN -ErrorAction SilentlyContinue
 
-            } elseif ($ConfigureObjectReplication -and $DryRun) {
-                Write-Log "  [DRYRUN] Would configure Object Replication (versioning + change feed + policy + monitoring)" "DRYRUN" $Progress
-                $ObjReplStatus = "DryRun"
+                # AzCopy S2S copy each share
+                try {
+                    foreach ($Share in $SourceShares) {
+                        $ShareName = $Share.Name
+                        $SourceUrl = "https://{0}.file.core.windows.net/{1}?{2}" -f $Source.AccountName, $ShareName, $SourceSas
+                        $DestUrl = "https://{0}.file.core.windows.net/{1}?{2}" -f $DestAccountName, $ShareName, $DestSas
+
+                        Write-Log "    Copying share (S2S): $ShareName..." "" $Progress
+
+                        # Server-side copy — data flows directly between Azure storage endpoints
+                        $azCopyArgs = @(
+                            "copy",
+                            $SourceUrl,
+                            $DestUrl,
+                            "--s2s-preserve-properties=true",
+                            "--s2s-preserve-access-tier=true",
+                            "--preserve-smb-permissions=true",
+                            "--preserve-smb-info=true",
+                            "--recursive"
+                        )
+                        & azcopy $azCopyArgs
+
+                        if ($LASTEXITCODE -eq 0) {
+                            Write-Log "    Share copied: $ShareName" "SUCCESS" $Progress
+                            $SharesCopiedThisRow++
+                            $TotalSharesCopied++
+                        } else {
+                            Write-Log "    AzCopy failed for share '$ShareName' (exit code: $LASTEXITCODE)" "WARN" $Progress
+                        }
+                    }
+                } finally {
+                    # Restore source firewall even on error
+                    if ($OriginalSourceNetworkSettings) {
+                        try {
+                            az account set --subscription $Source.SubscriptionId | Out-Null
+                            Restore-StorageFirewall -AccountName $Source.AccountName -ResourceGroup $Source.ResourceGroup -OriginalSettings $OriginalSourceNetworkSettings
+                            $OriginalSourceNetworkSettings = $null
+                        } catch {
+                            Write-Log "  WARNING: Failed to restore source firewall on '$($Source.AccountName)'. Check manually." "WARN" $Progress
+                        }
+                    }
+
+                    # Cleanup sensitive material
+                    $SourceKey = $null
+                    $DestKey = $null
+                    $SourceSas = $null
+                    $DestSas = $null
+                    Remove-Item env:AZURE_STORAGE_SAS_TOKEN -ErrorAction SilentlyContinue
+                }
+
+            } elseif ($DryRun -and $ShareCount -gt 0) {
+                Write-Log "  [DRYRUN] Would generate SAS tokens and copy $ShareCount share(s) via AzCopy (server-side)" "DRYRUN" $Progress
+                if ($SourceDefaultAction -eq "Deny" -or $SourcePublicAccess -eq "Disabled") {
+                    Write-Log "  [DRYRUN] Would temporarily open source firewall for AzCopy S2S copy" "DRYRUN" $Progress
+                }
             }
 
-            # 10. Apply networking LAST — after containers and Object Replication are done
+            # 10. Apply networking LAST — after shares and data copy are done
             if (-not $DryRun) {
-                if ($OriginalNetworkSettings) {
-                    # -SyncContainers mode: restore the original firewall settings
+                if ($OriginalDestNetworkSettings) {
+                    # Existing account: restore the original firewall settings
                     az account set --subscription $DestSubId | Out-Null
-                    Restore-DestFirewall -AccountName $DestAccountName -ResourceGroup $DestRGName -OriginalSettings $OriginalNetworkSettings
+                    Restore-StorageFirewall -AccountName $DestAccountName -ResourceGroup $DestRGName -OriginalSettings $OriginalDestNetworkSettings
                 } elseif ($AccountCreatedThisRun) {
                     # New account: apply source networking settings
                     az account set --subscription $DestSubId | Out-Null
@@ -937,7 +852,7 @@ try {
                     Write-Log "  Networking settings applied." "" $Progress
                 }
             } else {
-                if ($AccountCreatedThisRun -or $OriginalNetworkSettings) {
+                if ($AccountCreatedThisRun -or $OriginalDestNetworkSettings) {
                     Write-Log "  [DRYRUN] Would apply networking: $NetworkingConfig" "DRYRUN" $Progress
                 }
             }
@@ -954,10 +869,9 @@ try {
                 DestRegion         = $DestRegion
                 DestSubscription   = $DestSubId
                 AccountStatus      = $AccountStatus
-                ContainersCreated  = $ContainersCreatedThisRow
-                ContainersSkipped  = $ContainerSkipped
+                SharesCreated      = $SharesCreatedThisRow
+                SharesCopied       = $SharesCopiedThisRow
                 NetworkingConfig   = $NetworkingConfig
-                ObjectReplication  = $ObjReplStatus
                 Notes              = ""
             }
 
@@ -968,11 +882,21 @@ try {
             Write-Log "ERROR: $ErrorMessage" "ERROR" $Progress
             $AccountsFailed++
 
-            # Safety: if we opened the firewall, try to restore it even on error
-            if ($OriginalNetworkSettings -and -not $DryRun) {
+            # Safety: if we opened the source firewall, try to restore it even on error
+            if ($OriginalSourceNetworkSettings -and -not $DryRun) {
+                try {
+                    az account set --subscription $Source.SubscriptionId | Out-Null
+                    Restore-StorageFirewall -AccountName $Source.AccountName -ResourceGroup $Source.ResourceGroup -OriginalSettings $OriginalSourceNetworkSettings
+                } catch {
+                    Write-Log "  WARNING: Failed to restore source firewall on '$($Source.AccountName)'. Please check manually." "WARN" $Progress
+                }
+            }
+
+            # Safety: if we opened the dest firewall, try to restore it even on error
+            if ($OriginalDestNetworkSettings -and -not $DryRun) {
                 try {
                     az account set --subscription $DestSubId | Out-Null
-                    Restore-DestFirewall -AccountName $DestAccountName -ResourceGroup $DestRGName -OriginalSettings $OriginalNetworkSettings
+                    Restore-StorageFirewall -AccountName $DestAccountName -ResourceGroup $DestRGName -OriginalSettings $OriginalDestNetworkSettings
                 } catch {
                     Write-Log "  WARNING: Failed to restore firewall on '$DestAccountName'. Please check manually." "WARN" $Progress
                 }
@@ -985,10 +909,9 @@ try {
                 DestRegion         = $DestRegion
                 DestSubscription   = if ($DestSubId) { $DestSubId } else { "N/A" }
                 AccountStatus      = "Failed"
-                ContainersCreated  = 0
-                ContainersSkipped  = 0
+                SharesCreated      = 0
+                SharesCopied       = 0
                 NetworkingConfig   = ""
-                ObjectReplication  = ""
                 Notes              = $ErrorMessage
             }
             continue
@@ -997,7 +920,7 @@ try {
 
     # ── Export results CSV ─────────────────────────────────────────
     $TimestampStr = Get-Date -Format "yyyyMMdd_HHmmss"
-    $ResultsPath = ".\DRBlobStorageResults_$TimestampStr.csv"
+    $ResultsPath = ".\DRFileShareResults_$TimestampStr.csv"
     if ($Results.Count -gt 0) {
         $Results | Export-Csv -Path $ResultsPath -NoTypeInformation -Encoding UTF8
         Write-Log "Results CSV exported to: $ResultsPath"
@@ -1017,11 +940,8 @@ try {
     Write-Log "  Accounts already existed  : $AccountsExisted"
     Write-Log "  Accounts skipped (invalid): $AccountsSkipped" $(if ($AccountsSkipped -gt 0) { "WARN" } else { "INFO" })
     Write-Log "  Accounts failed           : $AccountsFailed"  $(if ($AccountsFailed -gt 0) { "ERROR" } else { "INFO" })
-    Write-Log "  Total containers created  : $TotalContainersCreated"
-    if ($ConfigureObjectReplication) {
-        $ObjReplConfigured = ($Results | Where-Object { $_.ObjectReplication -eq "Configured" }).Count
-        Write-Log "  Object Replication configured : $ObjReplConfigured"
-    }
+    Write-Log "  Total shares created      : $TotalSharesCreated"
+    Write-Log "  Total shares copied (S2S) : $TotalSharesCopied"
     Write-Log "  Total elapsed time        : $TotalDuration"
     Write-Log "  Results CSV               : $ResultsPath"
     Write-Log "==================================================================" "SUCCESS"
@@ -1046,4 +966,12 @@ try {
 } catch {
     Write-Log "FATAL SCRIPT ERROR: $($_.Exception.Message)" "ERROR"
     exit 1
+} finally {
+    # Clean up environment variables
+    if (Test-Path env:AZCOPY_AUTO_LOGIN_TYPE) {
+        Remove-Item env:AZCOPY_AUTO_LOGIN_TYPE -ErrorAction SilentlyContinue
+    }
+    if (Test-Path env:AZURE_STORAGE_SAS_TOKEN) {
+        Remove-Item env:AZURE_STORAGE_SAS_TOKEN -ErrorAction SilentlyContinue
+    }
 }

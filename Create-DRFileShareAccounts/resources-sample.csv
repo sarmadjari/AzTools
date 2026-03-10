@@ -1,0 +1,3 @@
+SourceResourceId,DestStorageAccountName,DestResourceGroupName
+/subscriptions/a43fece9-9bb5-49c6-8710-2fbce965d96a/resourceGroups/rg-files-prod/providers/Microsoft.Storage/storageAccounts/stfileprod01,stfiledr001,rg-dr-files-switzerlandnorth
+/subscriptions/a43fece9-9bb5-49c6-8710-2fbce965d96a/resourceGroups/rg-files-prod/providers/Microsoft.Storage/storageAccounts/stfileprod02,stfiledr002,rg-dr-files-switzerlandnorth
