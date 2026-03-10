@@ -1,0 +1,3 @@
+SourceResourceId,DestStorageAccountName,DestResourceGroupName
+/subscriptions/a43fece9-9bb5-49c6-8710-2fbce965d96a/resourceGroups/rg-gis-prod/providers/Microsoft.Storage/storageAccounts/starcgisprod01,starcgisdr001,rg-dr-gis-switzerlandnorth
+/subscriptions/a43fece9-9bb5-49c6-8710-2fbce965d96a/resourceGroups/rg-gis-prod/providers/Microsoft.Storage/storageAccounts/starcgisprod02,starcgisdr002,rg-dr-gis-switzerlandnorth
