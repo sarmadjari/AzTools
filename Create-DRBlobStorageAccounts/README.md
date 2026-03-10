@@ -4,7 +4,7 @@
 
 **Author:** Sarmad Jari | **Version:** 2.4 | **Date:** 2026-03-09
 
-Creates DR (Disaster Recovery) blob storage accounts from a CSV mapping file. Reads source storage account configurations and replicates them in a target region, including all blob containers. Optionally configures Object Replication.
+Creates DR (Disaster Recovery) blob storage accounts from a CSV mapping file. Reads source storage account configurations and replicates them in a target region, including all blob containers. Optionally configures Object Replication with replication monitoring enabled.
 
 ---
 
@@ -75,7 +75,7 @@ A sample CSV is provided: `resources-sample.csv`
 | `-DestRegion` | Yes | Azure region for destination accounts (e.g., `switzerlandnorth`) |
 | `-DestSubscriptionId` | No | Destination subscription ID. Defaults to the source subscription |
 | `-SyncContainers` | No | For existing accounts with firewall: temporarily opens firewall, syncs containers, restores firewall |
-| `-ConfigureObjectReplication` | No | Enables Object Replication (versioning, change feed, replication policies) |
+| `-ConfigureObjectReplication` | No | Enables Object Replication (versioning, change feed, replication policies with monitoring) |
 | `-DryRun` | No | Dry run — shows what would be created without making changes |
 
 ## Usage Examples
@@ -163,7 +163,7 @@ For each row in the CSV:
 | 4 | Create destination storage account (with default open networking) |
 | 5 | List source containers via **ARM Management Plane API** (bypasses source firewall), skip system containers (`$logs`, `$blobchangefeed`, etc.) |
 | 6 | Create matching containers on destination (while firewall is still open) |
-| 7 | If `-ConfigureObjectReplication`: enable versioning, change feed, create replication policies (auto-skipped for incompatible account types or if 0 containers) |
+| 7 | If `-ConfigureObjectReplication`: enable versioning, change feed, create replication policies with monitoring enabled (auto-skipped for incompatible account types or if 0 containers) |
 | 8 | Apply source networking settings (firewall) **LAST** — after all operations are complete |
 
 **Why ARM API for container listing:** Source storage accounts often have `defaultAction=Deny` firewall. The data plane (`az storage container list`) is blocked by the firewall, but the ARM Management Plane API (`management.azure.com`) bypasses it — no need to modify source firewall settings.
@@ -241,6 +241,7 @@ When `-ConfigureObjectReplication` is specified, the script first checks if the 
 | Blob versioning | **Enabled by script** | **Enabled by script** | Required by Azure before creating replication policies |
 | Change feed | **Enabled by script** | Not required | Required by Azure on source to track blob changes |
 | Replication policy | Applied (per container pair) | Created first, then mirrored to source | Both accounts must have the policy for replication to start |
+| Replication monitoring | **Enabled by script** | **Enabled by script** | Unlocks per-rule replication metrics and status tracking in Azure Monitor |
 
 ### Copy Scope: Everything (All Blobs)
 
@@ -258,6 +259,16 @@ The script automatically configures **both** accounts in two steps:
 **Both steps are required.** If only the destination has the policy, replication will **NOT** start. The source account needs the policy so Azure knows to watch for changes and replicate blobs to the destination. The script handles both steps automatically.
 
 > **Note:** This is the opposite of the Azure Portal UI (which starts from the source account and auto-creates on the destination). Under the hood, both approaches result in the policy existing on both accounts.
+
+### Replication Monitoring (Metrics)
+
+Replication monitoring is **enabled by default** on all policies created by the script. This sets `metrics.enabled = true` on the policy, which unlocks:
+
+- **Per-rule replication status** — track whether each container pair is actively replicating
+- **Replication lag metrics** — monitor how far behind the destination is from the source
+- **Azure Monitor integration** — query replication health via metrics, alerts, and dashboards
+
+> **Note:** Replication monitoring requires ARM API version `2024-01-01` or later. The script uses this API version for all Object Replication policy operations.
 
 ### Supported Account Types for Object Replication
 

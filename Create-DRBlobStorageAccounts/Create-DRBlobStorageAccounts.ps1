@@ -7,7 +7,7 @@
     and resource group names. Creates matching storage accounts in a target region,
     replicating source configuration (kind, SKU, HNS, TLS, access tier, networking).
     Creates all blob containers from source on destination. Optionally configures
-    Object Replication (versioning, change feed, replication policies).
+    Object Replication (versioning, change feed, replication policies with monitoring enabled).
 
     Compatible storage account types (for account creation):
       - StorageV2 (General Purpose v2) — most common
@@ -66,7 +66,8 @@
 
 .PARAMETER ConfigureObjectReplication
     Switch. Enables blob versioning on both accounts, change feed on source,
-    and creates object replication policies per container.
+    and creates object replication policies per container with replication
+    monitoring enabled (metrics and per-rule status tracking in Azure Monitor).
     Can be run independently after initial account creation.
 
 .PARAMETER DryRun
@@ -803,6 +804,8 @@ try {
                 # --- Prerequisites: Azure requires versioning + change feed BEFORE creating replication policies ---
                 # These are only enabled on compatible accounts (this block is skipped for incompatible types).
                 # No unnecessary changes are made to accounts that cannot use Object Replication.
+                # Replication monitoring (metrics.enabled = true) is set on the policy to unlock
+                # per-rule replication metrics and status tracking in Azure Monitor.
 
                 # Enable blob versioning on SOURCE (required for Object Replication)
                 az account set --subscription $Source.SubscriptionId | Out-Null
@@ -837,7 +840,7 @@ try {
 
                 # Check if a replication policy already exists between this source-destination pair
                 az account set --subscription $DestSubId | Out-Null
-                $ExistingPoliciesJson = az rest --method GET --url "https://management.azure.com${DestAccountArmId}/objectReplicationPolicies?api-version=2023-05-01" -o json 2>$null
+                $ExistingPoliciesJson = az rest --method GET --url "https://management.azure.com${DestAccountArmId}/objectReplicationPolicies?api-version=2024-01-01" -o json 2>$null
                 $ExistingPolicyId = $null
 
                 if ($ExistingPoliciesJson) {
@@ -855,16 +858,19 @@ try {
 
                 # Determine the policy endpoint — use existing ID to update, or 'default' to create new
                 $DestPolicyEndpoint = if ($ExistingPolicyId) {
-                    "https://management.azure.com${DestAccountArmId}/objectReplicationPolicies/${ExistingPolicyId}?api-version=2023-05-01"
+                    "https://management.azure.com${DestAccountArmId}/objectReplicationPolicies/${ExistingPolicyId}?api-version=2024-01-01"
                 } else {
-                    "https://management.azure.com${DestAccountArmId}/objectReplicationPolicies/default?api-version=2023-05-01"
+                    "https://management.azure.com${DestAccountArmId}/objectReplicationPolicies/default?api-version=2024-01-01"
                 }
 
+                # Build the policy payload — metrics.enabled unlocks replication monitoring
+                # (per-rule status and lag metrics in Azure Monitor). Requires api-version 2024-01-01+.
                 $PolicyPayload = @{
                     properties = @{
                         sourceAccount      = $SourceProps.id
                         destinationAccount = $DestAccountArmId
                         rules              = $Rules
+                        metrics            = @{ enabled = $true }
                     }
                 } | ConvertTo-Json -Depth 10
 
@@ -886,13 +892,14 @@ try {
                             sourceAccount      = $SourceProps.id
                             destinationAccount = $DestAccountArmId
                             rules              = $Rules
+                            metrics            = @{ enabled = $true }
                         }
                     } | ConvertTo-Json -Depth 10
 
                     $SourcePolicyPayload | Out-File -FilePath $TempFile -Encoding UTF8 -Force
 
                     az account set --subscription $Source.SubscriptionId | Out-Null
-                    az rest --method PUT --url "https://management.azure.com$($SourceProps.id)/objectReplicationPolicies/$PolicyId`?api-version=2023-05-01" --body "@$TempFile" -o none 2>$null
+                    az rest --method PUT --url "https://management.azure.com$($SourceProps.id)/objectReplicationPolicies/$PolicyId`?api-version=2024-01-01" --body "@$TempFile" -o none 2>$null
                     Write-Log "    Object Replication policy applied to source." "SUCCESS" $Progress
                     $ObjReplStatus = if ($ExistingPolicyId) { "Updated" } else { "Configured" }
                 } else {
@@ -903,7 +910,7 @@ try {
                 Remove-Item $TempFile -ErrorAction SilentlyContinue
 
             } elseif ($ConfigureObjectReplication -and $DryRun) {
-                Write-Log "  [DRYRUN] Would configure Object Replication (versioning + change feed + policy)" "DRYRUN" $Progress
+                Write-Log "  [DRYRUN] Would configure Object Replication (versioning + change feed + policy + monitoring)" "DRYRUN" $Progress
                 $ObjReplStatus = "DryRun"
             }
 
