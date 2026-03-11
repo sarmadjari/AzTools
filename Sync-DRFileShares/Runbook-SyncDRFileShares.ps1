@@ -1,69 +1,28 @@
 <#
 .SYNOPSIS
-    Syncs Azure File Shares from source to destination storage accounts using AzCopy.
+    Azure Automation Runbook: Syncs Azure File Shares from source to destination using AzCopy.
 
 .DESCRIPTION
-    Reads a CSV of source storage account ARM Resource IDs with destination account names
-    and resource groups. For each pair, discovers all file shares on the source and runs
-    azcopy sync to keep the destination shares in sync.
+    Automation-adapted version of Sync-DRFileShares.ps1, designed to run on a Hybrid
+    Runbook Worker with az cli and azcopy pre-installed.
 
-    Uses azcopy sync (not azcopy copy):
-      - Compares source vs destination and transfers only changed files
-      - Much faster on subsequent runs than azcopy copy (skips unchanged files)
-      - Optionally propagates deletions with Mirror mode
+    Authenticates via Managed Identity, retrieves CSV mapping and configuration from
+    Azure Automation Variables, then executes the same sync logic as the interactive
+    script: discovers source file shares, generates SAS tokens, temporarily opens
+    firewalls, runs azcopy sync, and restores firewalls in try/finally blocks.
 
-    SyncMode options:
-      - Additive (default): Syncs new and changed files. Never deletes files on the
-        destination, even if they no longer exist on the source.
-      - Mirror: Syncs new and changed files AND deletes files on the destination that
-        do not exist on the source. Use with caution — data on the destination that
-        has no corresponding source file will be permanently removed.
+    Configuration is stored in Automation Variables:
+      - SyncCSVContent       : CSV mapping content (encrypted)
+      - SyncMode             : "Additive" (default) or "Mirror"
+      - DestSubscriptionId   : Optional destination subscription override
 
-    Data flows directly between Azure storage endpoints (server-side copy) — nothing
-    passes through the client machine.
-
-    Firewall handling: Both source and destination firewalls are temporarily opened
-    (if restrictive) for the AzCopy data transfer, then restored via try/finally.
-
-    The script is idempotent — safe to re-run at any frequency.
-
-    IMPORTANT: This script does NOT create storage accounts or file shares. Both must
-    already exist. Use Create-DRFileShareAccounts.ps1 for initial DR setup.
-
-.PARAMETER CsvPath
-    Path to CSV with headers: SourceResourceId, DestStorageAccountName, DestResourceGroupName
-
-.PARAMETER DestSubscriptionId
-    Optional. Subscription for destination accounts. Defaults to source subscription.
-
-.PARAMETER SyncMode
-    Additive (default) or Mirror.
-    Additive = sync changes, never delete on destination.
-    Mirror   = sync changes + delete files on destination that don't exist on source.
-
-.PARAMETER DryRun
-    Switch. Dry run — shows what would be synced without making changes.
-
-.EXAMPLE
-    # Sync file shares (Additive — no deletes)
-    .\Sync-DRFileShares.ps1 -CsvPath ".\resources.csv"
-
-.EXAMPLE
-    # Dry run — preview what would be synced
-    .\Sync-DRFileShares.ps1 -CsvPath ".\resources.csv" -DryRun
-
-.EXAMPLE
-    # Mirror mode — sync with deletions
-    .\Sync-DRFileShares.ps1 -CsvPath ".\resources.csv" -SyncMode "Mirror"
-
-.EXAMPLE
-    # Cross-subscription
-    .\Sync-DRFileShares.ps1 -CsvPath ".\resources.csv" -DestSubscriptionId "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
+    Data flows directly between Azure storage endpoints (server-side copy).
+    The script is idempotent — safe to run on any schedule frequency.
 
 .NOTES
     Author  : Sarmad Jari
     Version : 1.0
-    Date    : 2026-03-10
+    Date    : 2026-03-11
     License : MIT License (https://opensource.org/licenses/MIT)
 
     DISCLAIMER
@@ -93,17 +52,7 @@
         production storage accounts
       - Following your organisation's approved change management, deployment, and
         operational practices
-
-    Always run with -DryRun first to review planned changes before executing live.
-    Use -SyncMode "Additive" (default) unless you explicitly need deletion propagation.
 #>
-
-param (
-    [Parameter(Mandatory=$true)][string]$CsvPath,
-    [Parameter(Mandatory=$false)][string]$DestSubscriptionId,
-    [Parameter(Mandatory=$false)][ValidateSet("Additive","Mirror")][string]$SyncMode = "Additive",
-    [switch]$DryRun
-)
 
 $ErrorActionPreference = "Stop"
 $ScriptStartTime = Get-Date
@@ -117,15 +66,8 @@ function Write-Log {
         [string]$Progress = ""
     )
     $Timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ssZ"
-    $Color = switch ($Level) {
-        "ERROR"   { "Red" }
-        "WARN"    { "Yellow" }
-        "DRYRUN"  { "Cyan" }
-        "SUCCESS" { "Green" }
-        default   { "White" }
-    }
     $Prefix = if ($Progress) { "[$Timestamp] [$Level] [$Progress] " } else { "[$Timestamp] [$Level] " }
-    Write-Host "$Prefix$Message" -ForegroundColor $Color
+    Write-Output "$Prefix$Message"
 }
 
 function Parse-ArmResourceId {
@@ -304,18 +246,60 @@ function Format-Duration {
     }
 }
 
+# ── Temp file for cleanup tracking ────────────────────────────────
+$TempCsvPath = $null
+
 try {
-    # ── Validate inputs ──────────────────────────────────────────
-    if (-Not (Test-Path $CsvPath)) {
-        throw "CSV file not found at path: $CsvPath"
+    # ── Authenticate via Managed Identity ─────────────────────────
+    Write-Log "Authenticating via Managed Identity..."
+
+    # Validate prerequisites on Hybrid Worker
+    $AzCliPath = Get-Command az -ErrorAction SilentlyContinue
+    if (-not $AzCliPath) {
+        throw "Azure CLI (az) is not installed on this Hybrid Worker. Install az cli before running this Runbook."
+    }
+    $AzCopyPath = Get-Command azcopy -ErrorAction SilentlyContinue
+    if (-not $AzCopyPath) {
+        throw "AzCopy is not installed on this Hybrid Worker. Install azcopy v10+ before running this Runbook."
     }
 
-    $CsvFullPath = (Resolve-Path $CsvPath).Path
-    Write-Log "Reading storage account mapping from $CsvFullPath..."
+    # Sign in az cli with VM's managed identity
+    $LoginResult = Invoke-AzCommand -Arguments @("login", "--identity", "--output", "none") -IgnoreExitCode
+    if ($LoginResult.ExitCode -ne 0) {
+        throw "Failed to authenticate az cli via Managed Identity: $($LoginResult.ErrorDetail)"
+    }
+    Write-Log "Authenticated via Managed Identity." "SUCCESS"
 
-    $AccountList = Import-Csv $CsvFullPath
+    # ── Retrieve configuration from Automation Variables ──────────
+    Write-Log "Retrieving configuration from Automation Variables..."
+
+    $CsvContent = Get-AutomationVariable -Name 'SyncCSVContent'
+    if ([string]::IsNullOrWhiteSpace($CsvContent)) {
+        throw "Automation Variable 'SyncCSVContent' is empty or not found. Re-run Setup-SyncAutomation.ps1 to configure."
+    }
+
+    $SyncMode = Get-AutomationVariable -Name 'SyncMode'
+    if ([string]::IsNullOrWhiteSpace($SyncMode)) {
+        $SyncMode = "Additive"
+    }
+
+    $DestSubscriptionId = Get-AutomationVariable -Name 'DestSubscriptionId'
+    if ([string]::IsNullOrWhiteSpace($DestSubscriptionId)) {
+        $DestSubscriptionId = $null
+    }
+
+    Write-Log "  SyncMode           : $SyncMode"
+    Write-Log "  DestSubscriptionId : $(if ($DestSubscriptionId) { $DestSubscriptionId } else { '(same as source)' })"
+
+    # Write CSV content to temp file
+    $TempCsvPath = Join-Path $env:TEMP "sync-dr-fileshares-$(Get-Date -Format 'yyyyMMddHHmmss').csv"
+    Set-Content -Path $TempCsvPath -Value $CsvContent -Encoding UTF8
+    Write-Log "  CSV written to temp file: $TempCsvPath"
+
+    # ── Validate CSV ──────────────────────────────────────────────
+    $AccountList = Import-Csv $TempCsvPath
     if ($AccountList.Count -eq 0) {
-        throw "CSV file is empty."
+        throw "CSV content is empty."
     }
 
     # Validate CSV headers
@@ -329,7 +313,7 @@ try {
     $TotalRows = $AccountList.Count
     Write-Log "Found $TotalRows account pair(s) in CSV."
 
-    # ── Pre-validation pass ──────────────────────────────────────
+    # ── Pre-validation pass ───────────────────────────────────────
     Write-Log "Running pre-validation on all $TotalRows rows..."
     $ValidationErrors = @()
     $SeenPairs = @{}
@@ -396,19 +380,13 @@ try {
             Write-Log "    -> $($Err.Error)" "ERROR"
         }
         Write-Log "==================================================================" "ERROR"
-        Write-Log "Fix the CSV and re-run. No Azure operations were performed." "ERROR"
-        exit 1
+        Write-Log "Fix the CSV (update SyncCSVContent variable) and re-run." "ERROR"
+        throw "Pre-validation failed with $($ValidationErrors.Count) error(s)."
     }
 
     Write-Log "PRE-VALIDATION PASSED: All $TotalRows rows are valid." "SUCCESS"
 
-    # ── Mode banners ─────────────────────────────────────────────
-    if ($DryRun) {
-        Write-Log "==================================================================" "DRYRUN"
-        Write-Log "  DRY RUN MODE -- no changes will be made" "DRYRUN"
-        Write-Log "==================================================================" "DRYRUN"
-    }
-
+    # ── Mode banners ──────────────────────────────────────────────
     Write-Log "=================================================================="
     Write-Log "  SyncMode : $SyncMode"
     if ($SyncMode -eq "Mirror") {
@@ -416,7 +394,7 @@ try {
     }
     Write-Log "=================================================================="
 
-    # ── Results tracking ─────────────────────────────────────────
+    # ── Results tracking ──────────────────────────────────────────
     $Results = @()
     $RowNum = 0
     $TotalSharesSynced = 0
@@ -424,7 +402,7 @@ try {
     $RowsSkipped = 0
     $RowsFailed = 0
 
-    # ── Process each CSV row ─────────────────────────────────────
+    # ── Process each CSV row ──────────────────────────────────────
     foreach ($Row in $AccountList) {
         $RowNum++
         $RowStartTime = Get-Date
@@ -504,35 +482,6 @@ try {
                 continue
             }
 
-            # ── DryRun path ──
-            if ($DryRun) {
-                Write-Log "  [DRYRUN] Would generate SAS tokens (4h expiry)" "DRYRUN" $Progress
-                if ($SourceDefaultAction -eq "Deny" -or $SourcePublicAccess -eq "Disabled") {
-                    Write-Log "  [DRYRUN] Would temporarily open source firewall (defaultAction=$SourceDefaultAction, publicAccess=$SourcePublicAccess)" "DRYRUN" $Progress
-                }
-                if ($DestDefaultAction -eq "Deny" -or $DestPublicAccess -eq "Disabled") {
-                    Write-Log "  [DRYRUN] Would temporarily open dest firewall (defaultAction=$DestDefaultAction, publicAccess=$DestPublicAccess)" "DRYRUN" $Progress
-                }
-                foreach ($ShareName in $SourceShares) {
-                    Write-Log "  [DRYRUN] Would azcopy sync share: $ShareName (SyncMode: $SyncMode)" "DRYRUN" $Progress
-                }
-                if ($SourceDefaultAction -eq "Deny" -or $SourcePublicAccess -eq "Disabled") {
-                    Write-Log "  [DRYRUN] Would restore source firewall" "DRYRUN" $Progress
-                }
-                if ($DestDefaultAction -eq "Deny" -or $DestPublicAccess -eq "Disabled") {
-                    Write-Log "  [DRYRUN] Would restore dest firewall" "DRYRUN" $Progress
-                }
-
-                $Results += [PSCustomObject]@{
-                    SourceAccount=$Source.AccountName; DestAccount=$DestAccountName; DestResourceGroup=$DestRGName
-                    DestSubscription=$DestSubId; SharesSynced=$ShareCount; SharesFailed=0
-                    SyncMode=$SyncMode; Status="DryRun"; Notes=""
-                }
-                $RowElapsed = (Get-Date) - $RowStartTime
-                Write-Log "  Done: $($Source.AccountName) -> $DestAccountName ($(Format-Duration $RowElapsed))" "SUCCESS" $Progress
-                continue
-            }
-
             # ── Step 5: Generate SAS tokens ──
             Write-Log "  Generating SAS tokens (4h expiry)..." "" $Progress
             $Expiry = (Get-Date).AddHours(4).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
@@ -544,7 +493,7 @@ try {
             }
             $SourceKey = (az storage account keys list -g $Source.ResourceGroup -n $Source.AccountName --query "[0].value" -o tsv)
             if ([string]::IsNullOrWhiteSpace($SourceKey)) {
-                throw "Failed to retrieve key for source account '$($Source.AccountName)'. Verify your identity has the 'Storage Account Key Operator Service Role' or 'Contributor' role on the source resource group."
+                throw "Failed to retrieve key for source account '$($Source.AccountName)'. Verify the Managed Identity has the 'Storage Account Key Operator Service Role' or 'Contributor' role on the source resource group."
             }
             $SourceSasRaw = az storage account generate-sas --account-name $Source.AccountName --account-key $SourceKey --services f --resource-types sco --permissions rl --expiry $Expiry -o tsv
             $SourceSas = (($SourceSasRaw | Out-String) -replace "[\r\n\s]", "").TrimStart('?')
@@ -556,7 +505,7 @@ try {
             }
             $DestKey = (az storage account keys list -g $DestRGName -n $DestAccountName --query "[0].value" -o tsv)
             if ([string]::IsNullOrWhiteSpace($DestKey)) {
-                throw "Failed to retrieve key for destination account '$DestAccountName'. Verify your identity has the 'Storage Account Key Operator Service Role' or 'Contributor' role on the destination resource group."
+                throw "Failed to retrieve key for destination account '$DestAccountName'. Verify the Managed Identity has the 'Storage Account Key Operator Service Role' or 'Contributor' role on the destination resource group."
             }
             $DestSasRaw = az storage account generate-sas --account-name $DestAccountName --account-key $DestKey --services f --resource-types sco --permissions acdlrwup --expiry $Expiry -o tsv
             $DestSas = (($DestSasRaw | Out-String) -replace "[\r\n\s]", "").TrimStart('?')
@@ -701,16 +650,7 @@ try {
         }
     }
 
-    # ── Export results CSV ────────────────────────────────────────
-    $TimestampStr = Get-Date -Format "yyyyMMdd_HHmmss"
-    $ResultsPath = ".\DRFileShareSyncResults_$TimestampStr.csv"
-
-    if ($Results.Count -gt 0) {
-        $Results | Export-Csv -Path $ResultsPath -NoTypeInformation -Encoding UTF8
-        Write-Log "Results CSV exported to: $ResultsPath"
-    }
-
-    # ── Summary ──────────────────────────────────────────────────
+    # ── Summary ───────────────────────────────────────────────────
     $TotalElapsed = (Get-Date) - $ScriptStartTime
     $TotalDuration = Format-Duration $TotalElapsed
 
@@ -724,9 +664,6 @@ try {
     Write-Log "  Rows skipped                 : $RowsSkipped"
     Write-Log "  Rows failed                  : $RowsFailed"
     Write-Log "  Total elapsed time           : $TotalDuration"
-    if ($Results.Count -gt 0) {
-        Write-Log "  Results CSV                  : $ResultsPath"
-    }
     Write-Log "=================================================================="
 
     # Failed rows detail
@@ -750,9 +687,14 @@ try {
     Write-Log "=================================================================="
 
 } catch {
-    Write-Log "FATAL SCRIPT ERROR: $($_.Exception.Message)" "ERROR"
-    exit 1
+    Write-Log "FATAL RUNBOOK ERROR: $($_.Exception.Message)" "ERROR"
+    throw
 } finally {
+    # Clean up temp CSV file
+    if ($TempCsvPath -and (Test-Path $TempCsvPath)) {
+        Remove-Item $TempCsvPath -Force -ErrorAction SilentlyContinue
+    }
+
     # Clean up environment variables
     if (Test-Path env:AZCOPY_AUTO_LOGIN_TYPE) {
         Remove-Item env:AZCOPY_AUTO_LOGIN_TYPE -ErrorAction SilentlyContinue

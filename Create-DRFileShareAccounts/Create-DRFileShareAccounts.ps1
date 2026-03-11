@@ -415,6 +415,13 @@ try {
             continue
         }
 
+        # --- Check for source == destination name collision ---
+        $SrcAccountName = $Parsed.AccountName.ToLower()
+        if ($SrcAccountName -eq $DestName) {
+            $ValidationErrors += [PSCustomObject]@{ Row = $CsvRowNum; Field = "DestStorageAccountName"; Value = $DestName; Error = "Source and destination have the same name. Storage account names are globally unique — use a different destination name." }
+            continue
+        }
+
         # --- Check for duplicate destination names ---
         if ($SeenDestNames.ContainsKey($DestName)) {
             $FirstRow = $SeenDestNames[$DestName]
@@ -543,6 +550,7 @@ try {
             $SourceTls        = if ($SourceProps.minimumTlsVersion) { $SourceProps.minimumTlsVersion } else { "TLS1_2" }
             $SourceAccessTier = if ($SourceProps.accessTier) { $SourceProps.accessTier } else { "Hot" }
             $SourceAllowBlobPublicAccess = if ($null -ne $SourceProps.allowBlobPublicAccess) { $SourceProps.allowBlobPublicAccess } else { $false }
+            $SourceAllowSharedKey = if ($null -ne $SourceProps.allowSharedKeyAccess) { $SourceProps.allowSharedKeyAccess } else { $true }
 
             # Source networking settings (to replicate on destination)
             $SourcePublicAccess  = if ($SourceProps.publicNetworkAccess) { $SourceProps.publicNetworkAccess } else { "Enabled" }
@@ -648,8 +656,11 @@ try {
                     "-o", "none"
                 )
 
-                # Access tier only for non-FileStorage accounts (FileStorage does not support --access-tier)
-                if ($SourceKind -ne "FileStorage") {
+                # Access tier only for Standard-tier accounts that support it.
+                # Premium SKUs (Premium_LRS, Premium_ZRS) and BlockBlobStorage/FileStorage kinds
+                # do not support --access-tier and will fail with InvalidRequestPropertyValue.
+                $SkipAccessTier = ($SourceKind -eq "FileStorage") -or ($SourceKind -eq "BlockBlobStorage") -or ($SourceSku -like "Premium_*")
+                if (-not $SkipAccessTier) {
                     $CreateArgs += @("--access-tier", $SourceAccessTier)
                 }
 
@@ -663,7 +674,8 @@ try {
 
                 if ($DryRun) {
                     Write-Log "  [DRYRUN] Would create storage account '$DestAccountName'" "DRYRUN" $Progress
-                    Write-Log "    kind=$SourceKind sku=$SourceSku hns=$SourceHns tls=$SourceTls tier=$SourceAccessTier" "DRYRUN" $Progress
+                    $DisplayTier = if ($SkipAccessTier) { "N/A (Premium)" } else { $SourceAccessTier }
+                    Write-Log "    kind=$SourceKind sku=$SourceSku hns=$SourceHns tls=$SourceTls tier=$DisplayTier" "DRYRUN" $Progress
                     $AccountCreatedThisRun = $true
                     $AccountStatus = "DryRun"
                 } else {
@@ -748,9 +760,12 @@ try {
 
                 # Source SAS (read + list)
                 az account set --subscription $Source.SubscriptionId | Out-Null
+                if (-not $SourceAllowSharedKey) {
+                    throw "Source account '$($Source.AccountName)' has shared key access disabled (allowSharedKeyAccess=false). Enable shared key access on the source account to allow SAS token generation for AzCopy."
+                }
                 $SourceKey = (az storage account keys list -g $Source.ResourceGroup -n $Source.AccountName --query "[0].value" -o tsv)
                 if ([string]::IsNullOrWhiteSpace($SourceKey)) {
-                    throw "Failed to retrieve key for source account '$($Source.AccountName)'."
+                    throw "Failed to retrieve key for source account '$($Source.AccountName)'. Verify your identity has the 'Storage Account Key Operator Service Role' or 'Contributor' role on the source resource group."
                 }
                 $SourceSasRaw = az storage account generate-sas --account-name $Source.AccountName --account-key $SourceKey --services f --resource-types sco --permissions rl --expiry $Expiry -o tsv
                 $SourceSas = (($SourceSasRaw | Out-String) -replace "[\r\n\s]", "").TrimStart('?')
@@ -759,7 +774,7 @@ try {
                 az account set --subscription $DestSubId | Out-Null
                 $DestKey = (az storage account keys list -g $DestRGName -n $DestAccountName --query "[0].value" -o tsv)
                 if ([string]::IsNullOrWhiteSpace($DestKey)) {
-                    throw "Failed to retrieve key for destination account '$DestAccountName'."
+                    throw "Failed to retrieve key for destination account '$DestAccountName'. Verify your identity has the 'Storage Account Key Operator Service Role' or 'Contributor' role on the destination resource group."
                 }
                 $DestSasRaw = az storage account generate-sas --account-name $DestAccountName --account-key $DestKey --services f --resource-types sco --permissions acdlrwup --expiry $Expiry -o tsv
                 $DestSas = (($DestSasRaw | Out-String) -replace "[\r\n\s]", "").TrimStart('?')
@@ -800,7 +815,7 @@ try {
                             $SharesCopiedThisRow++
                             $TotalSharesCopied++
                         } else {
-                            Write-Log "    AzCopy failed for share '$ShareName' (exit code: $LASTEXITCODE)" "WARN" $Progress
+                            Write-Log "    AzCopy failed for share '$ShareName' (exit code: $LASTEXITCODE). Check: firewall timing, private endpoints blocking public copy, or share-level permissions." "WARN" $Progress
                         }
                     }
                 } finally {

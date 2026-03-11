@@ -37,6 +37,8 @@ By using this script, you accept full responsibility for:
 - **AzCopy v10+** installed and in PATH
 - **PowerShell 7+** (`pwsh`) — available in Azure Cloud Shell
 - Permissions: Contributor or Storage Account Contributor on both source and destination subscriptions
+- **Storage Account Key Operator Service Role** (or Contributor) on both source and destination for key retrieval and SAS token generation
+- Both source and destination accounts must have `allowSharedKeyAccess` enabled (the script detects and reports this clearly if disabled)
 - **Both source and destination accounts must already exist** — use `Create-DRFileShareAccounts.ps1` to create them first
 
 ## CSV Format
@@ -237,9 +239,11 @@ Register-ScheduledTask -TaskName "DR-FileShare-Sync" -Action $Action -Trigger $T
 |---|---|---|---|---|
 | **ACI + Logic Apps** | Full | Unlimited | ~$1–5 | Low (recommended) |
 | **Azure VM + cron** | Full | Unlimited | $30–50 (VM) | High (VM management) |
-| **Azure Automation (Hybrid Worker)** | Full | Unlimited | $30–50 (VM) | Medium |
+| **Azure Automation (Hybrid Worker)** | Full | Unlimited | $30–50 (VM) | Medium (use `Setup-SyncAutomation.ps1`) |
 | **Azure Functions** | Limited | 5 min (Consumption) | Low | Low — but timeout is a blocker |
 | **Azure Automation (cloud)** | No azcopy in sandbox | 3 hours | ~$0.002/job | Low — but can't run azcopy |
+
+> **Note:** When using `-HybridWorkerVMResourceId`, `Setup-SyncAutomation.ps1` automatically detects and installs any missing prerequisites (Azure CLI, AzCopy, PowerShell 7) on the VM via `az vm run-command invoke`. For existing Hybrid Worker Groups (`-HybridWorkerGroup`), ensure the VM has these tools pre-installed.
 
 ## Running in Azure Cloud Shell
 
@@ -266,6 +270,16 @@ The script exports a timestamped results CSV: `DRFileShareSyncResults_YYYYMMDD_H
 | `SyncMode` | `Additive` or `Mirror` |
 | `Status` | `Completed`, `PartialFailure`, `Failed`, `Skipped`, or `DryRun` |
 | `Notes` | Error or skip reason |
+
+## Common Errors and Fixes
+
+| Error | Cause | Fix |
+|---|---|---|
+| `allowSharedKeyAccess=false` | Source or destination account has shared key access disabled by policy | Enable shared key access on the account, or contact your security team |
+| `Failed to retrieve key` | Missing RBAC permissions for key listing | Assign **Storage Account Key Operator Service Role** or **Contributor** on the resource group |
+| `AzCopy failed (exit code: N)` | Data-plane sync failure | Check: firewall timing (wait and retry), private endpoints blocking public copy, or share-level permissions |
+| `Source account not found` | Source account doesn't exist or wrong subscription | Verify the ARM Resource ID in the CSV |
+| `Destination account not found` | Destination account doesn't exist yet | Run `Create-DRFileShareAccounts.ps1` first to create destination accounts |
 
 ## Workflow
 

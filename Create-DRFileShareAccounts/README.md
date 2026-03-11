@@ -34,7 +34,8 @@ By using this script, you accept full responsibility for:
 - **AzCopy v10+** installed and available in PATH
 - **PowerShell 7+** (`pwsh`) — available in Azure Cloud Shell
 - Permissions: Contributor or Storage Account Contributor on both source and destination subscriptions
-- Storage Account Key access on both source and destination accounts (for SAS token generation)
+- **Storage Account Key Operator Service Role** (or Contributor) on source accounts for key retrieval and SAS token generation
+- Source accounts must have `allowSharedKeyAccess` enabled (the script detects and reports this clearly if disabled)
 
 ## CSV Format
 
@@ -92,6 +93,7 @@ Before any Azure operations begin, the script validates **all rows** in the CSV 
 | ARM Resource ID format | Must match `/subscriptions/.../storageAccounts/...` pattern |
 | Destination account name length | Must be 3-24 characters |
 | Destination account name characters | Must be lowercase alphanumeric only (`a-z`, `0-9`) |
+| Source == Destination name collision | Source and destination cannot have the same name (globally unique) |
 | Duplicate destination names | No two rows can target the same destination account name |
 | Empty fields | SourceResourceId, DestStorageAccountName, DestResourceGroupName must not be empty |
 
@@ -128,7 +130,7 @@ For each row in the CSV:
 | SKU (Standard_LRS, Premium_LRS, etc.) | Yes |
 | Hierarchical Namespace (HNS/ADLS Gen2) | Yes |
 | Minimum TLS version | Yes |
-| Access tier (Hot, Cool) | Yes (StorageV2 only; not applicable to FileStorage) |
+| Access tier (Hot, Cool) | Yes (StorageV2 only; skipped for Premium SKUs, FileStorage, and BlockBlobStorage) |
 | Allow blob public access | Yes |
 | Firewall (default action, bypass rules) | Yes |
 | Public network access setting | Yes |
@@ -213,6 +215,17 @@ The script exports a timestamped results CSV: `DRFileShareResults_YYYYMMDD_HHmms
 | `SharesCopied` | Number of file shares successfully copied via AzCopy S2S |
 | `NetworkingConfig` | Networking settings applied |
 | `Notes` | Detailed error/skip reasons (includes Azure Policy details for failures) |
+
+## Common Errors and Fixes
+
+| Error | Cause | Fix |
+|---|---|---|
+| `InvalidRequestPropertyValue: 'Hot' is not allowed for property accessTier` | Premium SKU accounts don't support access tier | Fixed in v1.1 — access tier is now skipped for Premium SKUs, FileStorage, and BlockBlobStorage |
+| `StorageAccountAlreadyTaken` (source == dest same name) | Source and destination have the same globally unique name | Fixed in v1.1 — pre-validation now catches this before any Azure calls |
+| `allowSharedKeyAccess=false` | Source account has shared key access disabled by policy | Enable shared key access on the source account, or contact your security team |
+| `Failed to retrieve key for source account` | Missing RBAC permissions for key listing | Assign **Storage Account Key Operator Service Role** or **Contributor** on the source resource group |
+| `AzCopy failed (exit code: N)` | Data-plane copy failure | Check: firewall timing (wait and retry), private endpoints blocking public copy, or share-level permissions |
+| `AZURE POLICY VIOLATION` | Azure Policy blocking account creation | Check the policy name and assignment in the error message; work with your governance team |
 
 ## Workflow
 
