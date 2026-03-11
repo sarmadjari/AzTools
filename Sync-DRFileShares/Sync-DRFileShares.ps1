@@ -7,6 +7,15 @@
     and resource groups. For each pair, discovers all file shares on the source and runs
     azcopy sync to keep the destination shares in sync.
 
+    Dual-mode script — works both interactively and as an Azure Automation Runbook:
+
+      Manual mode:  Provide -CsvPath to read from a file. Supports -DryRun, colored
+                    console output, and exports a timestamped results CSV.
+
+      Automation mode: When running on a Hybrid Runbook Worker, auto-detects the Azure
+                       Automation environment, authenticates via Managed Identity, and
+                       reads CSV mapping from an encrypted Automation Variable.
+
     Uses azcopy sync (not azcopy copy):
       - Compares source vs destination and transfers only changed files
       - Much faster on subsequent runs than azcopy copy (skips unchanged files)
@@ -31,15 +40,19 @@
     already exist. Use Create-DRFileShareAccounts.ps1 for initial DR setup.
 
 .PARAMETER CsvPath
-    Path to CSV with headers: SourceResourceId, DestStorageAccountName, DestResourceGroupName
+    Path to CSV with headers: SourceResourceId, DestStorageAccountName, DestResourceGroupName.
+    Required for manual mode. In Automation mode, CSV is read from the SyncCSVContent
+    Automation Variable if -CsvPath is not provided.
 
 .PARAMETER DestSubscriptionId
     Optional. Subscription for destination accounts. Defaults to source subscription.
+    In Automation mode, falls back to the DestSubscriptionId Automation Variable.
 
 .PARAMETER SyncMode
     Additive (default) or Mirror.
     Additive = sync changes, never delete on destination.
     Mirror   = sync changes + delete files on destination that don't exist on source.
+    In Automation mode, falls back to the SyncMode Automation Variable.
 
 .PARAMETER DryRun
     Switch. Dry run — shows what would be synced without making changes.
@@ -62,8 +75,8 @@
 
 .NOTES
     Author  : Sarmad Jari
-    Version : 1.0
-    Date    : 2026-03-10
+    Version : 2.0
+    Date    : 2026-03-11
     License : MIT License (https://opensource.org/licenses/MIT)
 
     DISCLAIMER
@@ -99,7 +112,7 @@
 #>
 
 param (
-    [Parameter(Mandatory=$true)][string]$CsvPath,
+    [Parameter(Mandatory=$false)][string]$CsvPath,
     [Parameter(Mandatory=$false)][string]$DestSubscriptionId,
     [Parameter(Mandatory=$false)][ValidateSet("Additive","Mirror")][string]$SyncMode = "Additive",
     [switch]$DryRun
@@ -107,6 +120,13 @@ param (
 
 $ErrorActionPreference = "Stop"
 $ScriptStartTime = Get-Date
+
+# ── Auto-detect execution context ────────────────────────────────
+$script:IsAutomation = $false
+try {
+    $null = Get-Command Get-AutomationVariable -ErrorAction Stop
+    $script:IsAutomation = $true
+} catch { }
 
 # ── Shared Functions ─────────────────────────────────────────────
 
@@ -117,15 +137,20 @@ function Write-Log {
         [string]$Progress = ""
     )
     $Timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ssZ"
-    $Color = switch ($Level) {
-        "ERROR"   { "Red" }
-        "WARN"    { "Yellow" }
-        "DRYRUN"  { "Cyan" }
-        "SUCCESS" { "Green" }
-        default   { "White" }
-    }
     $Prefix = if ($Progress) { "[$Timestamp] [$Level] [$Progress] " } else { "[$Timestamp] [$Level] " }
-    Write-Host "$Prefix$Message" -ForegroundColor $Color
+
+    if ($script:IsAutomation) {
+        Write-Output "$Prefix$Message"
+    } else {
+        $Color = switch ($Level) {
+            "ERROR"   { "Red" }
+            "WARN"    { "Yellow" }
+            "DRYRUN"  { "Cyan" }
+            "SUCCESS" { "Green" }
+            default   { "White" }
+        }
+        Write-Host "$Prefix$Message" -ForegroundColor $Color
+    }
 }
 
 function Parse-ArmResourceId {
@@ -304,18 +329,77 @@ function Format-Duration {
     }
 }
 
+# ── Temp file for cleanup tracking ────────────────────────────────
+$TempCsvPath = $null
+
 try {
-    # ── Validate inputs ──────────────────────────────────────────
-    if (-Not (Test-Path $CsvPath)) {
-        throw "CSV file not found at path: $CsvPath"
+    # ── Validate prerequisites ────────────────────────────────────
+    $AzCliPath = Get-Command az -ErrorAction SilentlyContinue
+    if (-not $AzCliPath) {
+        throw "Azure CLI (az) is not installed. Install from https://aka.ms/installazurecli"
+    }
+    $AzCopyPath = Get-Command azcopy -ErrorAction SilentlyContinue
+    if (-not $AzCopyPath) {
+        throw "AzCopy is not installed. Install azcopy v10+ from https://aka.ms/downloadazcopy-v10-windows"
     }
 
-    $CsvFullPath = (Resolve-Path $CsvPath).Path
-    Write-Log "Reading storage account mapping from $CsvFullPath..."
+    # ── Authenticate (Automation mode only) ───────────────────────
+    if ($script:IsAutomation) {
+        Write-Log "Automation mode detected. Authenticating via Managed Identity..."
+        $LoginResult = Invoke-AzCommand -Arguments @("login", "--identity", "--output", "none") -IgnoreExitCode
+        if ($LoginResult.ExitCode -ne 0) {
+            throw "Failed to authenticate az cli via Managed Identity: $($LoginResult.ErrorDetail)"
+        }
+        Write-Log "Authenticated via Managed Identity." "SUCCESS"
+    }
 
-    $AccountList = Import-Csv $CsvFullPath
+    # ── Resolve CSV source ────────────────────────────────────────
+    if ($CsvPath) {
+        # Manual mode — read from file
+        if (-Not (Test-Path $CsvPath)) {
+            throw "CSV file not found at path: $CsvPath"
+        }
+        $CsvFullPath = (Resolve-Path $CsvPath).Path
+        Write-Log "Reading storage account mapping from $CsvFullPath..."
+        $AccountList = Import-Csv $CsvFullPath
+    } elseif ($script:IsAutomation) {
+        # Automation mode — read from Automation Variable
+        Write-Log "Retrieving CSV mapping from Automation Variable 'SyncCSVContent'..."
+        $CsvContent = Get-AutomationVariable -Name 'SyncCSVContent'
+        if ([string]::IsNullOrWhiteSpace($CsvContent)) {
+            throw "Automation Variable 'SyncCSVContent' is empty or not found. Re-run Setup-SyncAutomation.ps1 to configure."
+        }
+        $TempCsvPath = Join-Path $env:TEMP "sync-dr-fileshares-$(Get-Date -Format 'yyyyMMddHHmmss').csv"
+        Set-Content -Path $TempCsvPath -Value $CsvContent -Encoding UTF8
+        $AccountList = Import-Csv $TempCsvPath
+        Write-Log "  CSV loaded from Automation Variable ($($AccountList.Count) rows)."
+    } else {
+        throw "No CSV source specified. Provide -CsvPath or run as an Azure Automation Runbook."
+    }
+
+    # ── Resolve config overrides from Automation Variables ─────────
+    if ($script:IsAutomation) {
+        # SyncMode: CLI parameter takes priority, then Automation Variable, then default
+        $VarSyncMode = Get-AutomationVariable -Name 'SyncMode'
+        if (-not [string]::IsNullOrWhiteSpace($VarSyncMode) -and $SyncMode -eq "Additive") {
+            $SyncMode = $VarSyncMode
+        }
+
+        # DestSubscriptionId: CLI parameter takes priority, then Automation Variable
+        if ([string]::IsNullOrWhiteSpace($DestSubscriptionId)) {
+            $VarDestSub = Get-AutomationVariable -Name 'DestSubscriptionId'
+            if (-not [string]::IsNullOrWhiteSpace($VarDestSub)) {
+                $DestSubscriptionId = $VarDestSub
+            }
+        }
+
+        Write-Log "  SyncMode           : $SyncMode"
+        Write-Log "  DestSubscriptionId : $(if ($DestSubscriptionId) { $DestSubscriptionId } else { '(same as source)' })"
+    }
+
+    # ── Validate CSV ──────────────────────────────────────────────
     if ($AccountList.Count -eq 0) {
-        throw "CSV file is empty."
+        throw "CSV is empty."
     }
 
     # Validate CSV headers
@@ -329,7 +413,7 @@ try {
     $TotalRows = $AccountList.Count
     Write-Log "Found $TotalRows account pair(s) in CSV."
 
-    # ── Pre-validation pass ──────────────────────────────────────
+    # ── Pre-validation pass ───────────────────────────────────────
     Write-Log "Running pre-validation on all $TotalRows rows..."
     $ValidationErrors = @()
     $SeenPairs = @{}
@@ -396,13 +480,14 @@ try {
             Write-Log "    -> $($Err.Error)" "ERROR"
         }
         Write-Log "==================================================================" "ERROR"
-        Write-Log "Fix the CSV and re-run. No Azure operations were performed." "ERROR"
-        exit 1
+        $FixMsg = if ($script:IsAutomation) { "Fix the CSV (update SyncCSVContent variable) and re-run." } else { "Fix the CSV and re-run." }
+        Write-Log "$FixMsg No Azure operations were performed." "ERROR"
+        throw "Pre-validation failed with $($ValidationErrors.Count) error(s)."
     }
 
     Write-Log "PRE-VALIDATION PASSED: All $TotalRows rows are valid." "SUCCESS"
 
-    # ── Mode banners ─────────────────────────────────────────────
+    # ── Mode banners ──────────────────────────────────────────────
     if ($DryRun) {
         Write-Log "==================================================================" "DRYRUN"
         Write-Log "  DRY RUN MODE -- no changes will be made" "DRYRUN"
@@ -416,7 +501,7 @@ try {
     }
     Write-Log "=================================================================="
 
-    # ── Results tracking ─────────────────────────────────────────
+    # ── Results tracking ──────────────────────────────────────────
     $Results = @()
     $RowNum = 0
     $TotalSharesSynced = 0
@@ -424,7 +509,7 @@ try {
     $RowsSkipped = 0
     $RowsFailed = 0
 
-    # ── Process each CSV row ─────────────────────────────────────
+    # ── Process each CSV row ──────────────────────────────────────
     foreach ($Row in $AccountList) {
         $RowNum++
         $RowStartTime = Get-Date
@@ -701,16 +786,16 @@ try {
         }
     }
 
-    # ── Export results CSV ────────────────────────────────────────
-    $TimestampStr = Get-Date -Format "yyyyMMdd_HHmmss"
-    $ResultsPath = ".\DRFileShareSyncResults_$TimestampStr.csv"
-
-    if ($Results.Count -gt 0) {
+    # ── Export results CSV (manual mode only) ─────────────────────
+    $ResultsPath = $null
+    if (-not $script:IsAutomation -and $Results.Count -gt 0) {
+        $TimestampStr = Get-Date -Format "yyyyMMdd_HHmmss"
+        $ResultsPath = ".\DRFileShareSyncResults_$TimestampStr.csv"
         $Results | Export-Csv -Path $ResultsPath -NoTypeInformation -Encoding UTF8
         Write-Log "Results CSV exported to: $ResultsPath"
     }
 
-    # ── Summary ──────────────────────────────────────────────────
+    # ── Summary ───────────────────────────────────────────────────
     $TotalElapsed = (Get-Date) - $ScriptStartTime
     $TotalDuration = Format-Duration $TotalElapsed
 
@@ -724,7 +809,7 @@ try {
     Write-Log "  Rows skipped                 : $RowsSkipped"
     Write-Log "  Rows failed                  : $RowsFailed"
     Write-Log "  Total elapsed time           : $TotalDuration"
-    if ($Results.Count -gt 0) {
+    if ($ResultsPath) {
         Write-Log "  Results CSV                  : $ResultsPath"
     }
     Write-Log "=================================================================="
@@ -750,9 +835,14 @@ try {
     Write-Log "=================================================================="
 
 } catch {
-    Write-Log "FATAL SCRIPT ERROR: $($_.Exception.Message)" "ERROR"
-    exit 1
+    Write-Log "FATAL ERROR: $($_.Exception.Message)" "ERROR"
+    if ($script:IsAutomation) { throw } else { exit 1 }
 } finally {
+    # Clean up temp CSV file (Automation mode)
+    if ($TempCsvPath -and (Test-Path $TempCsvPath)) {
+        Remove-Item $TempCsvPath -Force -ErrorAction SilentlyContinue
+    }
+
     # Clean up environment variables
     if (Test-Path env:AZCOPY_AUTO_LOGIN_TYPE) {
         Remove-Item env:AZCOPY_AUTO_LOGIN_TYPE -ErrorAction SilentlyContinue

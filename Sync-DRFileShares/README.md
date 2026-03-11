@@ -2,11 +2,20 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
-**Author:** Sarmad Jari | **Version:** 1.0 | **Date:** 2026-03-10
+**Author:** Sarmad Jari | **Version:** 2.0 | **Date:** 2026-03-11
 
 Syncs Azure File Shares from source to destination storage accounts using `azcopy sync`. Compares source vs destination and transfers only changed files — much faster on subsequent runs than `azcopy copy`. Supports Additive (default, no deletes) and Mirror (syncs deletions) modes.
 
 Data flows directly between Azure storage endpoints (server-side copy) — nothing passes through the client machine.
+
+**Dual-mode script** — works both interactively and as an Azure Automation Runbook:
+
+| Mode | Authentication | CSV Source | Output | DryRun |
+|---|---|---|---|---|
+| **Manual** | Existing `az login` | `-CsvPath` parameter | Colored console + results CSV | Yes |
+| **Automation** | Managed Identity | Automation Variable (`SyncCSVContent`) | Plain-text job logs | Yes |
+
+The script auto-detects which mode it's running in — no configuration needed.
 
 ---
 
@@ -60,11 +69,13 @@ A sample CSV is provided: `resources-sample.csv`
 
 ## Parameters
 
+All parameters are optional. In Automation mode, values fall back to Automation Variables.
+
 | Parameter | Required | Description |
 |---|---|---|
-| `-CsvPath` | Yes | Path to the CSV mapping file |
-| `-DestSubscriptionId` | No | Destination subscription ID. Defaults to the source subscription |
-| `-SyncMode` | No | `Additive` (default) or `Mirror`. Additive never deletes. Mirror syncs deletions |
+| `-CsvPath` | Manual: Yes | Path to the CSV mapping file. In Automation mode, falls back to `SyncCSVContent` Automation Variable |
+| `-DestSubscriptionId` | No | Destination subscription ID. Defaults to the source subscription. In Automation mode, falls back to `DestSubscriptionId` Automation Variable |
+| `-SyncMode` | No | `Additive` (default) or `Mirror`. In Automation mode, falls back to `SyncMode` Automation Variable |
 | `-DryRun` | No | Dry run — shows what would be synced without making changes |
 
 ## Sync Mode
@@ -78,29 +89,63 @@ A sample CSV is provided: `resources-sample.csv`
 
 ## Usage Examples
 
-### Basic sync (Additive — no deletes)
+### Manual Mode
 
 ```powershell
+# Basic sync (Additive — no deletes)
 ./Sync-DRFileShares.ps1 -CsvPath "./resources.csv"
-```
 
-### Dry run (preview changes without syncing anything)
-
-```powershell
+# Dry run (preview changes without syncing anything)
 ./Sync-DRFileShares.ps1 -CsvPath "./resources.csv" -DryRun
-```
 
-### Mirror mode (sync with deletions)
-
-```powershell
+# Mirror mode (sync with deletions)
 ./Sync-DRFileShares.ps1 -CsvPath "./resources.csv" -SyncMode "Mirror"
-```
 
-### Cross-subscription
-
-```powershell
+# Cross-subscription
 ./Sync-DRFileShares.ps1 -CsvPath "./resources.csv" -DestSubscriptionId "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
 ```
+
+### Automated Sync (Azure Automation + Hybrid Worker)
+
+Use `Setup-SyncAutomation.ps1` to deploy everything in one command:
+
+```powershell
+# Simplest — auto-creates a VM as Hybrid Worker
+./Setup-SyncAutomation.ps1 `
+    -AutomationAccountName "aa-dr-sync" `
+    -ResourceGroupName "rg-automation" `
+    -Location "switzerlandnorth" `
+    -CsvPath "./resources.csv" `
+    -ScheduleIntervalHours 4
+```
+
+If you already have a VM, pass its Resource ID instead:
+
+```powershell
+./Setup-SyncAutomation.ps1 `
+    -AutomationAccountName "aa-dr-sync" `
+    -ResourceGroupName "rg-automation" `
+    -Location "switzerlandnorth" `
+    -CsvPath "./resources.csv" `
+    -HybridWorkerVMResourceId "/subscriptions/.../virtualMachines/vm-hybrid-worker" `
+    -ScheduleIntervalHours 4
+```
+
+This creates and configures:
+
+| Resource | Details |
+|---|---|
+| Automation Account | Hosts the Runbook, schedule, and variables |
+| VM (auto-created if needed) | Small Linux VM (Standard_B2s) — override with `-VMSize` / `-VMOsType` |
+| System-Assigned Managed Identity | Secure auth — no credentials stored |
+| Hybrid Runbook Worker | VM-based execution (azcopy requires a real host, not a cloud sandbox) |
+| Recurring schedule | Configurable interval (default: every 6 hours) |
+| Automation Variables | `SyncCSVContent` (encrypted), `SyncMode`, `DestSubscriptionId` |
+| RBAC | Storage Account Contributor on all source and destination resource groups |
+
+Prerequisites (Azure CLI, AzCopy, PowerShell 7) are automatically installed on the VM. For existing Hybrid Worker Groups (`-HybridWorkerGroup`), ensure the VM has these tools pre-installed.
+
+To change the sync frequency, re-run `Setup-SyncAutomation.ps1` with a different `-ScheduleIntervalHours` value.
 
 ## Pre-Validation
 
@@ -121,8 +166,8 @@ For each row in the CSV:
 | Step | Action |
 |---|---|
 | 1 | Parse source ARM Resource ID, determine destination subscription |
-| 2 | Validate source account exists, capture firewall settings |
-| 3 | Look up destination account — fail if not found, capture firewall settings |
+| 2 | Validate source account exists, check `allowSharedKeyAccess`, capture firewall settings |
+| 3 | Look up destination account — fail if not found, check `allowSharedKeyAccess`, capture firewall settings |
 | 4 | List source file shares via **ARM REST API** (bypasses source firewall) |
 | 5 | Generate SAS tokens (4h expiry) for both accounts via management plane |
 | 6 | Temporarily open source firewall if restrictive (for AzCopy data transfer) |
@@ -167,95 +212,9 @@ The script is designed for repeated execution:
 - **SAS tokens** are cleaned up in every code path
 - **No side effects** — the script only syncs data, never creates/deletes accounts or shares
 
-## Running in Production
-
-### Option 1: Azure Container Instances + Logic Apps (Recommended)
-
-The most cost-effective and reliable production approach:
-
-```
-Logic Apps (Schedule Trigger: every 1h / 4h / daily)
-  |
-  v
-Azure Container Instance (PowerShell 7 + AzCopy)
-  |
-  v
-Runs Sync-DRFileShares.ps1
-  |
-  v
-Container exits when done (pay only for runtime)
-```
-
-**Dockerfile example:**
-
-```dockerfile
-FROM mcr.microsoft.com/azure-powershell:latest
-RUN curl -L https://aka.ms/downloadazcopy-v10-linux | tar xz --strip-components=1 -C /usr/local/bin
-COPY Sync-DRFileShares.ps1 /scripts/
-COPY resources.csv /scripts/
-WORKDIR /scripts
-CMD ["pwsh", "./Sync-DRFileShares.ps1", "-CsvPath", "./resources.csv"]
-```
-
-**Why ACI:**
-
-| Benefit | Details |
-|---|---|
-| No timeout limits | Runs as long as needed (hours for large shares) |
-| No VM to manage | Fully managed, no patching, no maintenance |
-| Minimal cost | ~$0.013/hour for 1 vCPU. A 15-min sync every 4h costs ~$0.02/month |
-| Managed Identity | Secure authentication without storing credentials |
-| Built-in logging | Container logs sent to Azure Monitor |
-| Restart on failure | Auto-restart policies available |
-
-### Option 2: Azure VM + cron / Task Scheduler
-
-If you already have a VM:
-
-**Linux (cron):**
-```bash
-# Every 4 hours
-0 */4 * * * /usr/bin/pwsh /opt/scripts/Sync-DRFileShares.ps1 -CsvPath "/opt/scripts/resources.csv" >> /var/log/dr-sync.log 2>&1
-```
-
-**Windows (Task Scheduler):**
-```powershell
-# Create scheduled task — every 4 hours
-$Action = New-ScheduledTaskAction -Execute "pwsh.exe" -Argument "-File C:\Scripts\Sync-DRFileShares.ps1 -CsvPath C:\Scripts\resources.csv"
-$Trigger = New-ScheduledTaskTrigger -RepetitionInterval (New-TimeSpan -Hours 4) -Once -At (Get-Date)
-Register-ScheduledTask -TaskName "DR-FileShare-Sync" -Action $Action -Trigger $Trigger -RunLevel Highest
-```
-
-### Option 3: Manual / On-Demand
-
-```powershell
-# Run directly from Cloud Shell or any terminal
-./Sync-DRFileShares.ps1 -CsvPath "./resources.csv"
-```
-
-### Production Scheduling Options Comparison
-
-| Approach | AzCopy Support | Max Runtime | Cost/Month | Operational Overhead |
-|---|---|---|---|---|
-| **ACI + Logic Apps** | Full | Unlimited | ~$1–5 | Low (recommended) |
-| **Azure VM + cron** | Full | Unlimited | $30–50 (VM) | High (VM management) |
-| **Azure Automation (Hybrid Worker)** | Full | Unlimited | $30–50 (VM) | Medium (use `Setup-SyncAutomation.ps1`) |
-| **Azure Functions** | Limited | 5 min (Consumption) | Low | Low — but timeout is a blocker |
-| **Azure Automation (cloud)** | No azcopy in sandbox | 3 hours | ~$0.002/job | Low — but can't run azcopy |
-
-> **Note:** When using `-HybridWorkerVMResourceId`, `Setup-SyncAutomation.ps1` automatically detects and installs any missing prerequisites (Azure CLI, AzCopy, PowerShell 7) on the VM via `az vm run-command invoke`. For existing Hybrid Worker Groups (`-HybridWorkerGroup`), ensure the VM has these tools pre-installed.
-
-## Running in Azure Cloud Shell
-
-Azure Cloud Shell has a 20-minute idle timeout. For long-running syncs, use `tmux`:
-
-```bash
-tmux new -s dr-sync
-pwsh ./Sync-DRFileShares.ps1 -CsvPath "./resources.csv"
-# If disconnected: tmux attach -t dr-sync
-```
-
 ## Output
+
+### Manual Mode
 
 The script exports a timestamped results CSV: `DRFileShareSyncResults_YYYYMMDD_HHmmss.csv`
 
@@ -271,6 +230,10 @@ The script exports a timestamped results CSV: `DRFileShareSyncResults_YYYYMMDD_H
 | `Status` | `Completed`, `PartialFailure`, `Failed`, `Skipped`, or `DryRun` |
 | `Notes` | Error or skip reason |
 
+### Automation Mode
+
+Output goes to the Azure Automation job log (plain text). No results CSV is exported — check job status in the Azure Portal.
+
 ## Common Errors and Fixes
 
 | Error | Cause | Fix |
@@ -280,6 +243,9 @@ The script exports a timestamped results CSV: `DRFileShareSyncResults_YYYYMMDD_H
 | `AzCopy failed (exit code: N)` | Data-plane sync failure | Check: firewall timing (wait and retry), private endpoints blocking public copy, or share-level permissions |
 | `Source account not found` | Source account doesn't exist or wrong subscription | Verify the ARM Resource ID in the CSV |
 | `Destination account not found` | Destination account doesn't exist yet | Run `Create-DRFileShareAccounts.ps1` first to create destination accounts |
+| `No CSV source specified` | Neither `-CsvPath` provided nor running in Automation | Provide `-CsvPath` for manual runs, or deploy via `Setup-SyncAutomation.ps1` for automation |
+| `SyncCSVContent is empty` | Automation Variable not configured | Re-run `Setup-SyncAutomation.ps1` to populate the variable |
+| `Failed to authenticate via Managed Identity` | MI not enabled or missing RBAC | Ensure the Automation Account has a System-Assigned MI with Storage Account Contributor role |
 
 ## Workflow
 
@@ -288,8 +254,8 @@ The script exports a timestamped results CSV: `DRFileShareSyncResults_YYYYMMDD_H
 2. Dry run sync           ->  ./Sync-DRFileShares.ps1 -CsvPath "./resources.csv" -DryRun
 3. First sync             ->  ./Sync-DRFileShares.ps1 -CsvPath "./resources.csv"
 4. Review results CSV     ->  Check DRFileShareSyncResults_*.csv for errors
-5. Schedule recurring     ->  ACI + Logic Apps, cron, or Task Scheduler
-6. (Optional) Mirror mode ->  ./Sync-DRFileShares.ps1 ... -SyncMode "Mirror"
+5. Automate               ->  ./Setup-SyncAutomation.ps1 (deploys Automation + Hybrid Worker + schedule)
+6. (Optional) Mirror mode ->  Re-run Setup-SyncAutomation.ps1 with -SyncMode "Mirror"
 ```
 
 ## License

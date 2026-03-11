@@ -478,6 +478,7 @@ try {
     $AccountsExisted = 0
     $AccountsSkipped = 0
     $AccountsFailed = 0
+    $AccountsCopySkipped = 0
     $TotalSharesCreated = 0
     $TotalSharesCopied = 0
 
@@ -643,6 +644,15 @@ try {
                     }
                 }
             } else {
+                # Check global name availability before attempting to create
+                $NameCheckJson = az storage account check-name --name $DestAccountName -o json 2>$null
+                if ($NameCheckJson) {
+                    $NameCheckResult = $NameCheckJson | ConvertFrom-Json
+                    if (-not $NameCheckResult.nameAvailable) {
+                        throw "Destination name '$DestAccountName' is globally unavailable — $($NameCheckResult.reason): $($NameCheckResult.message) Choose a different destination name in the CSV."
+                    }
+                }
+
                 # Build create command arguments — account is created with default open networking
                 $CreateArgs = @(
                     "storage", "account", "create",
@@ -657,9 +667,9 @@ try {
                 )
 
                 # Access tier only for Standard-tier accounts that support it.
-                # Premium SKUs (Premium_LRS, Premium_ZRS) and BlockBlobStorage/FileStorage kinds
-                # do not support --access-tier and will fail with InvalidRequestPropertyValue.
-                $SkipAccessTier = ($SourceKind -eq "FileStorage") -or ($SourceKind -eq "BlockBlobStorage") -or ($SourceSku -like "Premium_*")
+                # Premium SKUs (Premium_LRS, Premium_ZRS), BlockBlobStorage, FileStorage,
+                # and classic Storage (v1) kinds do not support --access-tier.
+                $SkipAccessTier = ($SourceKind -eq "FileStorage") -or ($SourceKind -eq "BlockBlobStorage") -or ($SourceKind -eq "Storage") -or ($SourceSku -like "Premium_*")
                 if (-not $SkipAccessTier) {
                     $CreateArgs += @("--access-tier", $SourceAccessTier)
                 }
@@ -683,8 +693,22 @@ try {
                     $CreateResult = Invoke-AzCommand -Arguments $CreateArgs
                     if (-not $CreateResult.Success) {
                         $ErrorMsg = $CreateResult.ErrorDetail
-                        Write-Log "  FAILED to create '$DestAccountName': $ErrorMsg" "ERROR" $Progress
-                        throw "Failed to create storage account '$DestAccountName': $ErrorMsg"
+
+                        # Retry without --access-tier if the error is about unsupported access tier
+                        if ($ErrorMsg -match "InvalidRequestPropertyValue" -and $ErrorMsg -match "accessTier" -and -not $SkipAccessTier) {
+                            Write-Log "  Access tier '$SourceAccessTier' not supported for this account type. Retrying without --access-tier..." "WARN" $Progress
+                            $CreateArgs = $CreateArgs | Where-Object { $_ -ne "--access-tier" -and $_ -ne $SourceAccessTier }
+                            $SkipAccessTier = $true
+                            $CreateResult = Invoke-AzCommand -Arguments $CreateArgs
+                            if (-not $CreateResult.Success) {
+                                $ErrorMsg = $CreateResult.ErrorDetail
+                                Write-Log "  FAILED to create '$DestAccountName': $ErrorMsg" "ERROR" $Progress
+                                throw "Failed to create storage account '$DestAccountName': $ErrorMsg"
+                            }
+                        } else {
+                            Write-Log "  FAILED to create '$DestAccountName': $ErrorMsg" "ERROR" $Progress
+                            throw "Failed to create storage account '$DestAccountName': $ErrorMsg"
+                        }
                     }
                     Write-Log "  Storage account '$DestAccountName' created." "SUCCESS" $Progress
                     $AccountCreatedThisRun = $true
@@ -752,90 +776,106 @@ try {
 
             # 9. AzCopy server-side (S2S) copy — data transfer
             $SharesCopiedThisRow = 0
+            $CopySkipReason = $null
 
             if (-not $DryRun -and $ShareCount -gt 0) {
                 Write-Log "  Generating SAS tokens for AzCopy S2S copy..." "" $Progress
 
                 $Expiry = (Get-Date).AddHours(4).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
 
-                # Source SAS (read + list)
+                # Source SAS (read + list) — gracefully skip data copy if keys are inaccessible
                 az account set --subscription $Source.SubscriptionId | Out-Null
                 if (-not $SourceAllowSharedKey) {
-                    throw "Source account '$($Source.AccountName)' has shared key access disabled (allowSharedKeyAccess=false). Enable shared key access on the source account to allow SAS token generation for AzCopy."
-                }
-                $SourceKey = (az storage account keys list -g $Source.ResourceGroup -n $Source.AccountName --query "[0].value" -o tsv)
-                if ([string]::IsNullOrWhiteSpace($SourceKey)) {
-                    throw "Failed to retrieve key for source account '$($Source.AccountName)'. Verify your identity has the 'Storage Account Key Operator Service Role' or 'Contributor' role on the source resource group."
-                }
-                $SourceSasRaw = az storage account generate-sas --account-name $Source.AccountName --account-key $SourceKey --services f --resource-types sco --permissions rl --expiry $Expiry -o tsv
-                $SourceSas = (($SourceSasRaw | Out-String) -replace "[\r\n\s]", "").TrimStart('?')
-
-                # Destination SAS (all permissions)
-                az account set --subscription $DestSubId | Out-Null
-                $DestKey = (az storage account keys list -g $DestRGName -n $DestAccountName --query "[0].value" -o tsv)
-                if ([string]::IsNullOrWhiteSpace($DestKey)) {
-                    throw "Failed to retrieve key for destination account '$DestAccountName'. Verify your identity has the 'Storage Account Key Operator Service Role' or 'Contributor' role on the destination resource group."
-                }
-                $DestSasRaw = az storage account generate-sas --account-name $DestAccountName --account-key $DestKey --services f --resource-types sco --permissions acdlrwup --expiry $Expiry -o tsv
-                $DestSas = (($DestSasRaw | Out-String) -replace "[\r\n\s]", "").TrimStart('?')
-
-                # Temporarily open source firewall if needed for AzCopy S2S copy
-                if ($SourceDefaultAction -eq "Deny" -or $SourcePublicAccess -eq "Disabled") {
-                    az account set --subscription $Source.SubscriptionId | Out-Null
-                    $OriginalSourceNetworkSettings = Open-StorageFirewall -AccountName $Source.AccountName -ResourceGroup $Source.ResourceGroup
+                    $CopySkipReason = "Source account '$($Source.AccountName)' has shared key access disabled (allowSharedKeyAccess=false). Enable shared key access to allow data copy."
+                    Write-Log "  WARNING: $CopySkipReason" "WARN" $Progress
+                    Write-Log "  Skipping data copy. Account and shares were created — re-run after fixing to copy data." "WARN" $Progress
                 }
 
-                # Clear env var to prevent SAS cross-contamination
-                Remove-Item env:AZURE_STORAGE_SAS_TOKEN -ErrorAction SilentlyContinue
-
-                # AzCopy S2S copy each share
-                try {
-                    foreach ($Share in $SourceShares) {
-                        $ShareName = $Share.Name
-                        $SourceUrl = "https://{0}.file.core.windows.net/{1}?{2}" -f $Source.AccountName, $ShareName, $SourceSas
-                        $DestUrl = "https://{0}.file.core.windows.net/{1}?{2}" -f $DestAccountName, $ShareName, $DestSas
-
-                        Write-Log "    Copying share (S2S): $ShareName..." "" $Progress
-
-                        # Server-side copy — data flows directly between Azure storage endpoints
-                        $azCopyArgs = @(
-                            "copy",
-                            $SourceUrl,
-                            $DestUrl,
-                            "--s2s-preserve-properties=true",
-                            "--s2s-preserve-access-tier=true",
-                            "--preserve-smb-permissions=true",
-                            "--preserve-smb-info=true",
-                            "--recursive"
-                        )
-                        & azcopy $azCopyArgs
-
-                        if ($LASTEXITCODE -eq 0) {
-                            Write-Log "    Share copied: $ShareName" "SUCCESS" $Progress
-                            $SharesCopiedThisRow++
-                            $TotalSharesCopied++
-                        } else {
-                            Write-Log "    AzCopy failed for share '$ShareName' (exit code: $LASTEXITCODE). Check: firewall timing, private endpoints blocking public copy, or share-level permissions." "WARN" $Progress
-                        }
+                if (-not $CopySkipReason) {
+                    $SourceKey = (az storage account keys list -g $Source.ResourceGroup -n $Source.AccountName --query "[0].value" -o tsv)
+                    if ([string]::IsNullOrWhiteSpace($SourceKey)) {
+                        $CopySkipReason = "Failed to retrieve key for source account '$($Source.AccountName)'. Ensure 'Storage Account Key Operator Service Role' or 'Contributor' on the source resource group."
+                        Write-Log "  WARNING: $CopySkipReason" "WARN" $Progress
+                        Write-Log "  Skipping data copy. Account and shares were created — re-run after fixing to copy data." "WARN" $Progress
                     }
-                } finally {
-                    # Restore source firewall even on error
-                    if ($OriginalSourceNetworkSettings) {
-                        try {
-                            az account set --subscription $Source.SubscriptionId | Out-Null
-                            Restore-StorageFirewall -AccountName $Source.AccountName -ResourceGroup $Source.ResourceGroup -OriginalSettings $OriginalSourceNetworkSettings
-                            $OriginalSourceNetworkSettings = $null
-                        } catch {
-                            Write-Log "  WARNING: Failed to restore source firewall on '$($Source.AccountName)'. Check manually." "WARN" $Progress
-                        }
+                }
+
+                if (-not $CopySkipReason) {
+                    $SourceSasRaw = az storage account generate-sas --account-name $Source.AccountName --account-key $SourceKey --services f --resource-types sco --permissions rl --expiry $Expiry -o tsv
+                    $SourceSas = (($SourceSasRaw | Out-String) -replace "[\r\n\s]", "").TrimStart('?')
+
+                    # Destination SAS (all permissions)
+                    az account set --subscription $DestSubId | Out-Null
+                    $DestKey = (az storage account keys list -g $DestRGName -n $DestAccountName --query "[0].value" -o tsv)
+                    if ([string]::IsNullOrWhiteSpace($DestKey)) {
+                        $CopySkipReason = "Failed to retrieve key for destination account '$DestAccountName'. Ensure 'Storage Account Key Operator Service Role' or 'Contributor' on the destination resource group."
+                        Write-Log "  WARNING: $CopySkipReason" "WARN" $Progress
+                        Write-Log "  Skipping data copy. Account and shares were created — re-run after fixing to copy data." "WARN" $Progress
+                    }
+                }
+
+                if (-not $CopySkipReason) {
+                    $DestSasRaw = az storage account generate-sas --account-name $DestAccountName --account-key $DestKey --services f --resource-types sco --permissions acdlrwup --expiry $Expiry -o tsv
+                    $DestSas = (($DestSasRaw | Out-String) -replace "[\r\n\s]", "").TrimStart('?')
+
+                    # Temporarily open source firewall if needed for AzCopy S2S copy
+                    if ($SourceDefaultAction -eq "Deny" -or $SourcePublicAccess -eq "Disabled") {
+                        az account set --subscription $Source.SubscriptionId | Out-Null
+                        $OriginalSourceNetworkSettings = Open-StorageFirewall -AccountName $Source.AccountName -ResourceGroup $Source.ResourceGroup
                     }
 
-                    # Cleanup sensitive material
-                    $SourceKey = $null
-                    $DestKey = $null
-                    $SourceSas = $null
-                    $DestSas = $null
+                    # Clear env var to prevent SAS cross-contamination
                     Remove-Item env:AZURE_STORAGE_SAS_TOKEN -ErrorAction SilentlyContinue
+
+                    # AzCopy S2S copy each share
+                    try {
+                        foreach ($Share in $SourceShares) {
+                            $ShareName = $Share.Name
+                            $SourceUrl = "https://{0}.file.core.windows.net/{1}?{2}" -f $Source.AccountName, $ShareName, $SourceSas
+                            $DestUrl = "https://{0}.file.core.windows.net/{1}?{2}" -f $DestAccountName, $ShareName, $DestSas
+
+                            Write-Log "    Copying share (S2S): $ShareName..." "" $Progress
+
+                            # Server-side copy — data flows directly between Azure storage endpoints
+                            $azCopyArgs = @(
+                                "copy",
+                                $SourceUrl,
+                                $DestUrl,
+                                "--s2s-preserve-properties=true",
+                                "--s2s-preserve-access-tier=true",
+                                "--preserve-smb-permissions=true",
+                                "--preserve-smb-info=true",
+                                "--recursive"
+                            )
+                            & azcopy $azCopyArgs
+
+                            if ($LASTEXITCODE -eq 0) {
+                                Write-Log "    Share copied: $ShareName" "SUCCESS" $Progress
+                                $SharesCopiedThisRow++
+                                $TotalSharesCopied++
+                            } else {
+                                Write-Log "    AzCopy failed for share '$ShareName' (exit code: $LASTEXITCODE). Check: firewall timing, private endpoints blocking public copy, or share-level permissions." "WARN" $Progress
+                            }
+                        }
+                    } finally {
+                        # Restore source firewall even on error
+                        if ($OriginalSourceNetworkSettings) {
+                            try {
+                                az account set --subscription $Source.SubscriptionId | Out-Null
+                                Restore-StorageFirewall -AccountName $Source.AccountName -ResourceGroup $Source.ResourceGroup -OriginalSettings $OriginalSourceNetworkSettings
+                                $OriginalSourceNetworkSettings = $null
+                            } catch {
+                                Write-Log "  WARNING: Failed to restore source firewall on '$($Source.AccountName)'. Check manually." "WARN" $Progress
+                            }
+                        }
+
+                        # Cleanup sensitive material
+                        $SourceKey = $null
+                        $DestKey = $null
+                        $SourceSas = $null
+                        $DestSas = $null
+                        Remove-Item env:AZURE_STORAGE_SAS_TOKEN -ErrorAction SilentlyContinue
+                    }
                 }
 
             } elseif ($DryRun -and $ShareCount -gt 0) {
@@ -876,7 +916,18 @@ try {
             $RowElapsed = (Get-Date) - $RowStartTime
             $RowDuration = Format-Duration $RowElapsed
 
-            # Record results
+            # Record results — adjust status if data copy was skipped due to key/permission issues
+            $RowNotes = ""
+            if ($CopySkipReason) {
+                if ($AccountStatus -eq "Created") {
+                    $AccountStatus = "CreatedNoCopy"
+                } elseif ($AccountStatus -eq "AlreadyExists") {
+                    $AccountStatus = "ExistsNoCopy"
+                }
+                $RowNotes = "Data copy skipped: $CopySkipReason"
+                $AccountsCopySkipped++
+            }
+
             $Results += [PSCustomObject]@{
                 SourceAccount      = $Source.AccountName
                 DestAccount        = $DestAccountName
@@ -887,10 +938,11 @@ try {
                 SharesCreated      = $SharesCreatedThisRow
                 SharesCopied       = $SharesCopiedThisRow
                 NetworkingConfig   = $NetworkingConfig
-                Notes              = ""
+                Notes              = $RowNotes
             }
 
-            Write-Log "  Done: $($Source.AccountName) -> $DestAccountName ($RowDuration)" "SUCCESS" $Progress
+            $ResultLevel = if ($CopySkipReason) { "WARN" } else { "SUCCESS" }
+            Write-Log "  Done: $($Source.AccountName) -> $DestAccountName ($RowDuration)" $ResultLevel $Progress
 
         } catch {
             $ErrorMessage = $_.Exception.Message
@@ -954,6 +1006,7 @@ try {
     Write-Log "  Accounts created          : $AccountsCreated" "SUCCESS"
     Write-Log "  Accounts already existed  : $AccountsExisted"
     Write-Log "  Accounts skipped (invalid): $AccountsSkipped" $(if ($AccountsSkipped -gt 0) { "WARN" } else { "INFO" })
+    Write-Log "  Accounts copy skipped     : $AccountsCopySkipped" $(if ($AccountsCopySkipped -gt 0) { "WARN" } else { "INFO" })
     Write-Log "  Accounts failed           : $AccountsFailed"  $(if ($AccountsFailed -gt 0) { "ERROR" } else { "INFO" })
     Write-Log "  Total shares created      : $TotalSharesCreated"
     Write-Log "  Total shares copied (S2S) : $TotalSharesCopied"

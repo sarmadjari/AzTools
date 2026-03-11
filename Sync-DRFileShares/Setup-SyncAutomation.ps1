@@ -10,10 +10,11 @@
       1. Creates (or reuses) an Azure Automation Account
       2. Enables System-Assigned Managed Identity
       3. Optionally registers a VM as a Hybrid Runbook Worker
+         (auto-creates a small VM if none provided)
       4. Checks and installs prerequisites (az cli, azcopy, pwsh) on the VM
       5. Assigns RBAC (Storage Account Contributor) at Resource Group scope
       6. Imports Az PowerShell modules into the Automation Account
-      7. Uploads and publishes the Runbook (Runbook-SyncDRFileShares.ps1)
+      7. Uploads and publishes the Runbook (Sync-DRFileShares.ps1)
       8. Stores CSV mapping and config as Automation Variables
       9. Creates a recurring schedule and links it to the Runbook
 
@@ -55,6 +56,14 @@
     Worker extension, and creates a worker group named "hwg-sync-dr-fileshares".
     Mutually exclusive with -HybridWorkerGroup.
 
+.PARAMETER VMSize
+    VM size for auto-created Hybrid Worker VM (default: Standard_B2s).
+    Only used when neither -HybridWorkerGroup nor -HybridWorkerVMResourceId is provided.
+
+.PARAMETER VMOsType
+    OS type for auto-created VM: Linux (default) or Windows.
+    Linux is recommended (cheaper, lighter). Only used when auto-creating a VM.
+
 .PARAMETER DestSubscriptionId
     Optional. Subscription for destination storage accounts. Defaults to source
     subscription (parsed from CSV).
@@ -79,8 +88,12 @@
     .\Setup-SyncAutomation.ps1 -AutomationAccountName "aa-dr-sync" -ResourceGroupName "rg-automation" -Location "switzerlandnorth" -CsvPath ".\resources.csv" -HybridWorkerVMResourceId "/subscriptions/.../Microsoft.Compute/virtualMachines/vm-worker01"
 
 .EXAMPLE
+    # Simplest setup — auto-creates a VM as Hybrid Worker
+    .\Setup-SyncAutomation.ps1 -AutomationAccountName "aa-dr-sync" -ResourceGroupName "rg-automation" -Location "switzerlandnorth" -CsvPath ".\resources.csv" -ScheduleIntervalHours 4
+
+.EXAMPLE
     # Dry run — preview what would be created
-    .\Setup-SyncAutomation.ps1 -AutomationAccountName "aa-dr-sync" -ResourceGroupName "rg-automation" -Location "switzerlandnorth" -CsvPath ".\resources.csv" -HybridWorkerGroup "my-worker-group" -DryRun
+    .\Setup-SyncAutomation.ps1 -AutomationAccountName "aa-dr-sync" -ResourceGroupName "rg-automation" -Location "switzerlandnorth" -CsvPath ".\resources.csv" -DryRun
 
 .EXAMPLE
     # Cross-subscription, Mirror mode, every 4 hours
@@ -112,7 +125,7 @@
         organisational standards
       - Verifying RBAC assignments and Managed Identity permissions
       - Verifying the Hybrid Worker VM prerequisites if using -HybridWorkerGroup
-        (auto-installed when using -HybridWorkerVMResourceId)
+        (auto-installed when using -HybridWorkerVMResourceId or auto-created VM)
       - Testing in lower environments (development / staging) before running against
         production storage accounts
       - Following your organisation's approved change management, deployment, and
@@ -128,6 +141,8 @@ param (
     [Parameter(Mandatory=$true)][string]$CsvPath,
     [Parameter(Mandatory=$false)][string]$HybridWorkerGroup,
     [Parameter(Mandatory=$false)][string]$HybridWorkerVMResourceId,
+    [Parameter(Mandatory=$false)][string]$VMSize = "Standard_B2s",
+    [Parameter(Mandatory=$false)][ValidateSet("Linux","Windows")][string]$VMOsType = "Linux",
     [Parameter(Mandatory=$false)][string]$DestSubscriptionId,
     [Parameter(Mandatory=$false)][ValidateRange(1,24)][int]$ScheduleIntervalHours = 6,
     [Parameter(Mandatory=$false)][ValidateSet("Additive","Mirror")][string]$SyncMode = "Additive",
@@ -430,6 +445,83 @@ if (-not (Get-Command pwsh -ErrorAction SilentlyContinue)) {
     }
 }
 
+function Register-HybridWorker {
+    <#
+    .SYNOPSIS
+        Enables MI on a VM, installs prerequisites, and registers it as a Hybrid Worker.
+        Returns a hashtable with VMPrincipalId and VMResourceId.
+    #>
+    param(
+        [string]$VMName,
+        [string]$VMResourceGroup,
+        [string]$VMSubscriptionId,
+        [string]$WorkerGroupName,
+        [string]$AutomationAccountName,
+        [string]$AAResourceGroup,
+        [object]$AACheckResult  # Result of the AA show command (for automationHybridServiceUrl)
+    )
+
+    $Result = @{ VMPrincipalId = $null; VMResourceId = $null }
+
+    # Enable VM's System-Assigned Managed Identity
+    Write-Log "  Enabling Managed Identity on VM '$VMName'..."
+    az account set --subscription $VMSubscriptionId | Out-Null
+    $VMUpdate = Invoke-AzCommand -Arguments @(
+        "vm", "identity", "assign",
+        "--name", $VMName,
+        "--resource-group", $VMResourceGroup,
+        "-o", "json"
+    )
+    if ($VMUpdate.ExitCode -ne 0) {
+        throw "Failed to enable MI on VM: $($VMUpdate.ErrorDetail)"
+    }
+    $VMIdentity = $VMUpdate.StdOut | ConvertFrom-Json
+    $Result.VMPrincipalId = $VMIdentity.systemAssignedIdentity
+    Write-Log "  VM Managed Identity enabled. Principal ID: $($Result.VMPrincipalId)" "SUCCESS"
+
+    # Detect VM OS type
+    $VMInfo = Invoke-AzCommand -Arguments @(
+        "vm", "show",
+        "--name", $VMName,
+        "--resource-group", $VMResourceGroup,
+        "--query", "storageProfile.osDisk.osType",
+        "-o", "tsv"
+    )
+    $DetectedOsType = if ($VMInfo.StdOut) { $VMInfo.StdOut.Trim() } else { "Windows" }
+
+    # Build VM Resource ID
+    $Result.VMResourceId = "/subscriptions/$VMSubscriptionId/resourceGroups/$VMResourceGroup/providers/Microsoft.Compute/virtualMachines/$VMName"
+
+    # Install prerequisites on VM
+    Write-Log "  Checking and installing prerequisites on VM '$VMName' ($DetectedOsType)..."
+    Install-VMPrerequisites -VMName $VMName -VMResourceGroup $VMResourceGroup -VMOsType $DetectedOsType
+
+    # Create Hybrid Worker Group
+    Write-Log "  Creating Hybrid Worker Group '$WorkerGroupName'..."
+    $HWGCreate = Invoke-AzCommand -Arguments @(
+        "automation", "hrwg", "create",
+        "--automation-account-name", $AutomationAccountName,
+        "--resource-group", $AAResourceGroup,
+        "--name", $WorkerGroupName,
+        "-o", "none"
+    ) -IgnoreExitCode
+
+    # Register VM as Hybrid Worker
+    Write-Log "  Registering VM '$VMName' as Hybrid Worker..."
+    $HWCreate = Invoke-AzCommand -Arguments @(
+        "automation", "hrwg", "hrw", "create",
+        "--automation-account-name", $AutomationAccountName,
+        "--resource-group", $AAResourceGroup,
+        "--hybrid-runbook-worker-group-name", $WorkerGroupName,
+        "--name", $VMName,
+        "--vm-resource-id", $Result.VMResourceId,
+        "-o", "none"
+    ) -IgnoreExitCode
+    Write-Log "  Hybrid Worker registered." "SUCCESS"
+
+    return $Result
+}
+
 try {
     # ── Step 1: Validate prerequisites ────────────────────────────
     Write-Log "Validating prerequisites..."
@@ -462,9 +554,9 @@ try {
     Write-Log "Reading storage account mapping from $CsvFullPath..."
 
     # Check Runbook file
-    $RunbookPath = Join-Path $PSScriptRoot "Runbook-SyncDRFileShares.ps1"
+    $RunbookPath = Join-Path $PSScriptRoot "Sync-DRFileShares.ps1"
     if (-not (Test-Path $RunbookPath)) {
-        throw "Runbook file not found: $RunbookPath. Ensure Runbook-SyncDRFileShares.ps1 is in the same directory as this script."
+        throw "Runbook file not found: $RunbookPath. Ensure Sync-DRFileShares.ps1 is in the same directory as this script."
     }
 
     # ── Step 2: Pre-validate CSV ──────────────────────────────────
@@ -657,10 +749,11 @@ try {
     # ── Step 5: Hybrid Worker setup ───────────────────────────────
     $EffectiveWorkerGroup = $null
     $VMPrincipalId = $null
+    $VMCreatedByScript = $false
 
     if ($HybridWorkerVMResourceId) {
-        # Register a VM as Hybrid Worker
-        Write-Log "Setting up Hybrid Runbook Worker from VM..."
+        # ── Option A: Use an existing VM as Hybrid Worker ──
+        Write-Log "Setting up Hybrid Runbook Worker from existing VM..."
 
         # Parse VM resource ID
         if ($HybridWorkerVMResourceId -notmatch "(?i)^/subscriptions/([^/]+)/resourceGroups/([^/]+)/providers/Microsoft\.Compute/virtualMachines/([^/]+)$") {
@@ -669,88 +762,31 @@ try {
         $VMSubId = $Matches[1]
         $VMRGName = $Matches[2]
         $VMName = $Matches[3]
-
         $EffectiveWorkerGroup = "hwg-sync-dr-fileshares"
 
         if ($DryRun) {
             Write-Log "  [DRYRUN] Would enable System-Assigned MI on VM '$VMName'" "DRYRUN"
             Write-Log "  [DRYRUN] Would check and install prerequisites (az cli, azcopy, pwsh) on VM '$VMName'" "DRYRUN"
-            Write-Log "  [DRYRUN] Would install Hybrid Worker extension on VM '$VMName'" "DRYRUN"
             Write-Log "  [DRYRUN] Would create Hybrid Worker Group '$EffectiveWorkerGroup'" "DRYRUN"
+            Write-Log "  [DRYRUN] Would register VM as Hybrid Worker" "DRYRUN"
         } else {
-            # Enable VM's System-Assigned Managed Identity
-            Write-Log "  Enabling Managed Identity on VM '$VMName'..."
-            az account set --subscription $VMSubId | Out-Null
-            $VMUpdate = Invoke-AzCommand -Arguments @(
-                "vm", "identity", "assign",
-                "--name", $VMName,
-                "--resource-group", $VMRGName,
-                "-o", "json"
-            )
-            if ($VMUpdate.ExitCode -ne 0) {
-                throw "Failed to enable MI on VM: $($VMUpdate.ErrorDetail)"
-            }
-            $VMIdentity = $VMUpdate.StdOut | ConvertFrom-Json
-            $VMPrincipalId = $VMIdentity.systemAssignedIdentity
-            Write-Log "  VM Managed Identity enabled. Principal ID: $VMPrincipalId" "SUCCESS"
-
-            # Get Automation Account resource ID for extension
-            $AASubId = ($CurrentAccount.id)
-            $AAResourceId = "/subscriptions/$AASubId/resourceGroups/$ResourceGroupName/providers/Microsoft.Automation/automationAccounts/$AutomationAccountName"
-
-            # Detect VM OS type for the correct extension
-            $VMInfo = Invoke-AzCommand -Arguments @(
-                "vm", "show",
-                "--name", $VMName,
-                "--resource-group", $VMRGName,
-                "--query", "storageProfile.osDisk.osType",
-                "-o", "tsv"
-            )
-            $VMOsType = if ($VMInfo.StdOut) { $VMInfo.StdOut.Trim() } else { "Windows" }
-            $ExtensionName = if ($VMOsType -eq "Linux") { "HybridWorkerForLinux" } else { "HybridWorkerForWindows" }
-            $ExtPublisher = "Microsoft.Azure.Automation.HybridWorker"
-            $ExtType = "HybridWorkerForWindows"
-            if ($VMOsType -eq "Linux") { $ExtType = "HybridWorkerForLinux" }
-
-            # ── Install prerequisites on VM if missing ──
-            Write-Log "  Checking and installing prerequisites on VM '$VMName' ($VMOsType)..."
-            Install-VMPrerequisites -VMName $VMName -VMResourceGroup $VMRGName -VMOsType $VMOsType
-
-            # Install the Hybrid Worker extension
-            Write-Log "  Installing Hybrid Worker extension ($ExtType) on VM '$VMName'..."
-            $ExtSettings = "{`"AutomationAccountURL`":`"$(($AACheck.StdOut | ConvertFrom-Json).automationHybridServiceUrl)`"}"
-
-            # Create Hybrid Worker Group first
-            Write-Log "  Creating Hybrid Worker Group '$EffectiveWorkerGroup'..."
-            $HWGCreate = Invoke-AzCommand -Arguments @(
-                "automation", "hrwg", "create",
-                "--automation-account-name", $AutomationAccountName,
-                "--resource-group", $ResourceGroupName,
-                "--name", $EffectiveWorkerGroup,
-                "-o", "none"
-            ) -IgnoreExitCode
-            # Ignore error if group already exists
-
-            # Add VM as Hybrid Worker to the group
-            Write-Log "  Registering VM '$VMName' as Hybrid Worker..."
-            $HWCreate = Invoke-AzCommand -Arguments @(
-                "automation", "hrwg", "hrw", "create",
-                "--automation-account-name", $AutomationAccountName,
-                "--resource-group", $ResourceGroupName,
-                "--hybrid-runbook-worker-group-name", $EffectiveWorkerGroup,
-                "--name", $VMName,
-                "--vm-resource-id", $HybridWorkerVMResourceId,
-                "-o", "none"
-            ) -IgnoreExitCode
-            Write-Log "  Hybrid Worker registered." "SUCCESS"
+            $HWResult = Register-HybridWorker `
+                -VMName $VMName `
+                -VMResourceGroup $VMRGName `
+                -VMSubscriptionId $VMSubId `
+                -WorkerGroupName $EffectiveWorkerGroup `
+                -AutomationAccountName $AutomationAccountName `
+                -AAResourceGroup $ResourceGroupName `
+                -AACheckResult $AACheck
+            $VMPrincipalId = $HWResult.VMPrincipalId
         }
+
     } elseif ($HybridWorkerGroup) {
-        # Use existing Hybrid Worker Group
+        # ── Option B: Use an existing Hybrid Worker Group ──
         $EffectiveWorkerGroup = $HybridWorkerGroup
         Write-Log "Using existing Hybrid Worker Group: '$HybridWorkerGroup'"
 
         if (-not $DryRun) {
-            # Validate the group exists
             $HWGCheck = Invoke-AzCommand -Arguments @(
                 "automation", "hrwg", "show",
                 "--automation-account-name", $AutomationAccountName,
@@ -765,30 +801,86 @@ try {
                 Write-Log "  Hybrid Worker Group validated." "SUCCESS"
             }
         }
+
     } else {
-        # No Hybrid Worker specified — check for existing groups
-        Write-Log "No Hybrid Worker specified. Checking for existing worker groups..."
-        if (-not $DryRun -and $AACheck.ExitCode -eq 0) {
-            $HWGList = Invoke-AzCommand -Arguments @(
-                "automation", "hrwg", "list",
-                "--automation-account-name", $AutomationAccountName,
+        # ── Option C: Auto-create a VM as Hybrid Worker ──
+        $VMName = "vm-hwk-$($AutomationAccountName.ToLower() -replace '[^a-z0-9]','')"
+        if ($VMName.Length -gt 15) { $VMName = $VMName.Substring(0, 15) }
+        $EffectiveWorkerGroup = "hwg-sync-dr-fileshares"
+        $AASubId = $CurrentAccount.id
+
+        Write-Log "No Hybrid Worker specified. Auto-creating VM '$VMName' ($VMOsType, $VMSize)..."
+
+        if ($DryRun) {
+            Write-Log "  [DRYRUN] Would create VM '$VMName' (size: $VMSize, os: $VMOsType) in '$ResourceGroupName'" "DRYRUN"
+            Write-Log "  [DRYRUN] Would enable System-Assigned MI on VM '$VMName'" "DRYRUN"
+            Write-Log "  [DRYRUN] Would check and install prerequisites (az cli, azcopy, pwsh) on VM" "DRYRUN"
+            Write-Log "  [DRYRUN] Would create Hybrid Worker Group '$EffectiveWorkerGroup'" "DRYRUN"
+            Write-Log "  [DRYRUN] Would register VM as Hybrid Worker" "DRYRUN"
+        } else {
+            # Check if VM already exists (idempotent re-runs)
+            $VMCheck = Invoke-AzCommand -Arguments @(
+                "vm", "show",
+                "--name", $VMName,
                 "--resource-group", $ResourceGroupName,
                 "-o", "json"
             ) -IgnoreExitCode
-            if ($HWGList.ExitCode -eq 0 -and $HWGList.StdOut) {
-                $Groups = $HWGList.StdOut | ConvertFrom-Json
-                if ($Groups.Count -gt 0) {
-                    $EffectiveWorkerGroup = $Groups[0].name
-                    Write-Log "  Found existing Hybrid Worker Group: '$EffectiveWorkerGroup'. Will use it." "SUCCESS"
+
+            if ($VMCheck.ExitCode -eq 0) {
+                Write-Log "  VM '$VMName' already exists. Reusing." "SUCCESS"
+            } else {
+                # Create the VM
+                $Image = if ($VMOsType -eq "Linux") { "Ubuntu2204" } else { "Win2022Datacenter" }
+
+                $azVmArgs = @(
+                    "vm", "create",
+                    "--name", $VMName,
+                    "--resource-group", $ResourceGroupName,
+                    "--location", $Location,
+                    "--image", $Image,
+                    "--size", $VMSize,
+                    "--assign-identity",
+                    "--admin-username", "azadmin",
+                    "--public-ip-address", "",
+                    "-o", "json"
+                )
+
+                # Linux: SSH keys (no password needed). Windows: generate random password.
+                if ($VMOsType -eq "Linux") {
+                    $azVmArgs += "--generate-ssh-keys"
+                    $azVmArgs += "--authentication-type"
+                    $azVmArgs += "ssh"
+                } else {
+                    # Generate a random 24-char password for Windows admin
+                    $VMPassword = -join ((48..57) + (65..90) + (97..122) + (33,35,36,37,38,42,64) | Get-Random -Count 24 | ForEach-Object { [char]$_ })
+                    $azVmArgs += "--admin-password"
+                    $azVmArgs += $VMPassword
+                }
+
+                Write-Log "  Creating VM '$VMName' ($VMOsType, $VMSize) in '$ResourceGroupName'..."
+                $VMCreateResult = Invoke-AzCommand -Arguments $azVmArgs
+                if ($VMCreateResult.ExitCode -ne 0) {
+                    throw "Failed to create VM '$VMName': $($VMCreateResult.ErrorDetail)"
+                }
+                Write-Log "  VM '$VMName' created." "SUCCESS"
+                $VMCreatedByScript = $true
+
+                if ($VMOsType -eq "Windows") {
+                    Write-Log "  Admin credentials: username=azadmin (password shown once, store securely)" "WARN"
+                    Write-Log "  Admin password: $VMPassword" "WARN"
                 }
             }
-        }
 
-        if (-not $EffectiveWorkerGroup) {
-            Write-Log "  WARNING: No Hybrid Worker Group configured." "WARN"
-            Write-Log "  The Runbook requires a Hybrid Worker (azcopy cannot run in cloud sandbox)." "WARN"
-            Write-Log "  Provide -HybridWorkerGroup or -HybridWorkerVMResourceId to configure one." "WARN"
-            Write-Log "  Continuing setup — you can link a Hybrid Worker later." "WARN"
+            # Register as Hybrid Worker (MI, prerequisites, HWG, worker)
+            $HWResult = Register-HybridWorker `
+                -VMName $VMName `
+                -VMResourceGroup $ResourceGroupName `
+                -VMSubscriptionId $AASubId `
+                -WorkerGroupName $EffectiveWorkerGroup `
+                -AutomationAccountName $AutomationAccountName `
+                -AAResourceGroup $ResourceGroupName `
+                -AACheckResult $AACheck
+            $VMPrincipalId = $HWResult.VMPrincipalId
         }
     }
 
@@ -1117,11 +1209,14 @@ try {
     if ($VMPrincipalId) {
         Write-Log "  VM MI Principal ID       : $VMPrincipalId"
     }
+    if ($VMCreatedByScript) {
+        Write-Log "  VM created               : $VMName ($VMSize, $VMOsType)"
+    }
     Write-Log "  RBAC scopes              : $($UniqueRGScopes.Count) resource group(s)"
     Write-Log "  Runbook                  : $RunbookName"
     Write-Log "  Schedule                 : $ScheduleName (every ${ScheduleIntervalHours}h)"
     Write-Log "  SyncMode                 : $SyncMode"
-    Write-Log "  Run target               : $(if ($EffectiveWorkerGroup) { "Hybrid Worker: $EffectiveWorkerGroup" } else { 'Not configured (see warning above)' })"
+    Write-Log "  Run target               : $(if ($EffectiveWorkerGroup) { "Hybrid Worker: $EffectiveWorkerGroup" } else { '(dry-run)' })"
     Write-Log "  CSV rows                 : $TotalRows"
     Write-Log "  Total elapsed time       : $TotalDuration"
     Write-Log "=================================================================="
@@ -1132,13 +1227,6 @@ try {
         Write-Log "  NOTE: RBAC role assignments may take 5-10 minutes to propagate." "WARN"
         Write-Log "  If the first scheduled run fails with permission errors, wait" "WARN"
         Write-Log "  and retry from the Azure portal." "WARN"
-    }
-
-    if (-not $EffectiveWorkerGroup -and -not $DryRun) {
-        Write-Log ""
-        Write-Log "  WARNING: No Hybrid Worker configured. The Runbook will fail if" "WARN"
-        Write-Log "  run on the cloud sandbox (azcopy is not available). Configure a" "WARN"
-        Write-Log "  Hybrid Worker before the first scheduled run." "WARN"
     }
 
     Write-Log "=================================================================="

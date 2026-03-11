@@ -130,7 +130,7 @@ For each row in the CSV:
 | SKU (Standard_LRS, Premium_LRS, etc.) | Yes |
 | Hierarchical Namespace (HNS/ADLS Gen2) | Yes |
 | Minimum TLS version | Yes |
-| Access tier (Hot, Cool) | Yes (StorageV2 only; skipped for Premium SKUs, FileStorage, and BlockBlobStorage) |
+| Access tier (Hot, Cool) | Yes (StorageV2 only; skipped for Premium SKUs, FileStorage, BlockBlobStorage, and classic Storage v1) |
 | Allow blob public access | Yes |
 | Firewall (default action, bypass rules) | Yes |
 | Public network access setting | Yes |
@@ -210,20 +210,30 @@ The script exports a timestamped results CSV: `DRFileShareResults_YYYYMMDD_HHmms
 | `DestResourceGroup` | Destination resource group |
 | `DestRegion` | Destination region |
 | `DestSubscription` | Destination subscription ID |
-| `AccountStatus` | `Created`, `AlreadyExists`, `Skipped`, or `Failed` |
+| `AccountStatus` | `Created`, `AlreadyExists`, `CreatedNoCopy`, `ExistsNoCopy`, `Skipped`, or `Failed` |
 | `SharesCreated` | Number of file shares created on destination |
 | `SharesCopied` | Number of file shares successfully copied via AzCopy S2S |
 | `NetworkingConfig` | Networking settings applied |
 | `Notes` | Detailed error/skip reasons (includes Azure Policy details for failures) |
 
+## Smart Error Handling
+
+The script handles common issues automatically instead of failing:
+
+| Issue | How it's handled |
+|---|---|
+| **Access tier not supported** | Auto-retries without `--access-tier` when the source account type doesn't support it (Premium, FileStorage, BlockBlobStorage, Storage v1). Account is created successfully. |
+| **Storage account name globally taken** | Checks name availability (`az storage account check-name`) before creating. Fails fast with a clear message instead of hitting the Azure API error. |
+| **Failed to retrieve source key** | Skips data copy gracefully — account and shares are still created. Status shows `CreatedNoCopy` or `ExistsNoCopy`. Fix RBAC and re-run to copy data. |
+| **`allowSharedKeyAccess=false` on source** | Same as above — skips data copy, creates account and shares. Enable shared key access and re-run. |
+
 ## Common Errors and Fixes
 
 | Error | Cause | Fix |
 |---|---|---|
-| `InvalidRequestPropertyValue: 'Hot' is not allowed for property accessTier` | Premium SKU accounts don't support access tier | Fixed in v1.1 — access tier is now skipped for Premium SKUs, FileStorage, and BlockBlobStorage |
-| `StorageAccountAlreadyTaken` (source == dest same name) | Source and destination have the same globally unique name | Fixed in v1.1 — pre-validation now catches this before any Azure calls |
-| `allowSharedKeyAccess=false` | Source account has shared key access disabled by policy | Enable shared key access on the source account, or contact your security team |
-| `Failed to retrieve key for source account` | Missing RBAC permissions for key listing | Assign **Storage Account Key Operator Service Role** or **Contributor** on the source resource group |
+| `Name globally unavailable` | Destination name already exists in another subscription | Use a different destination name in the CSV |
+| `allowSharedKeyAccess=false` | Source account has shared key access disabled by policy | Enable shared key access on the source account, or contact your security team. Re-run the script to copy data. |
+| `Failed to retrieve key for source account` | Missing RBAC permissions for key listing | Assign **Storage Account Key Operator Service Role** or **Contributor** on the source resource group. Re-run the script to copy data. |
 | `AzCopy failed (exit code: N)` | Data-plane copy failure | Check: firewall timing (wait and retry), private endpoints blocking public copy, or share-level permissions |
 | `AZURE POLICY VIOLATION` | Azure Policy blocking account creation | Check the policy name and assignment in the error message; work with your governance team |
 
