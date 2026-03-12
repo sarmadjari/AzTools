@@ -78,6 +78,10 @@ Contains two scripts:
 2. Ongoing sync          →  Sync-DRFileShares.ps1 (manual or automated via Setup-SyncAutomation.ps1)
 ```
 
+## Docs
+
+- [Azure Storage Replication Methods](./Docs/azure-storage-replication-methods.md), compatibility reference covering redundancy options, replication mechanisms, and account type support matrices.
+
 ## Prerequisites
 
 - **Azure CLI** (`az`) installed and authenticated (`az login`)
