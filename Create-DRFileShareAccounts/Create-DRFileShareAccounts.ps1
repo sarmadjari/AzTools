@@ -23,6 +23,10 @@
     with firewall restrictions, the script temporarily opens the source firewall
     for AzCopy, then restores the original settings.
 
+    Transient errors (network timeouts, proxy failures, Azure throttling) are
+    automatically retried with exponential backoff (up to 2 retries) during
+    storage account creation.
+
     The script is idempotent — safe to re-run:
       - Existing storage accounts are skipped (not recreated), but new shares are synced.
       - Existing shares on the destination are not affected.
@@ -250,38 +254,67 @@ function Invoke-AzCommand {
     .SYNOPSIS
         Runs an Azure CLI command and captures both stdout and stderr for detailed error reporting.
         Returns a hashtable with Success, StdOut, StdErr, and ErrorDetail.
+        Optionally retries on transient network/proxy/throttling errors with exponential backoff.
     #>
     param(
         [string[]]$Arguments,
-        [switch]$IgnoreExitCode
+        [switch]$IgnoreExitCode,
+        [int]$MaxRetries = 0,
+        [int]$RetryDelaySeconds = 15
     )
 
-    $TempStdErr = [System.IO.Path]::GetTempFileName()
-    $TempStdOut = [System.IO.Path]::GetTempFileName()
+    # Pattern matching transient network, proxy, and throttling errors worth retrying
+    $TransientPattern = "Cannot connect to proxy|Tunnel connection failed|Proxy Authorization Required|" +
+        "connection timed out|Connection refused|Network is unreachable|temporarily unavailable|" +
+        "ETIMEDOUT|ECONNREFUSED|ECONNRESET|ECONNABORTED|socket hang up|getaddrinfo|" +
+        "RetryableError|RequestTimeout|ServiceUnavailable|BadGateway|GatewayTimeout|" +
+        "TooManyRequests|throttled|503 Service|502 Bad Gateway|504 Gateway"
 
-    try {
-        & az @Arguments > $TempStdOut 2> $TempStdErr
-        $ExitCode = $LASTEXITCODE
+    $Attempt = 0
+    while ($true) {
+        $TempStdErr = [System.IO.Path]::GetTempFileName()
+        $TempStdOut = [System.IO.Path]::GetTempFileName()
 
-        $StdOutContent = if (Test-Path $TempStdOut) { Get-Content $TempStdOut -Raw -ErrorAction SilentlyContinue } else { "" }
-        $StdErrContent = if (Test-Path $TempStdErr) { Get-Content $TempStdErr -Raw -ErrorAction SilentlyContinue } else { "" }
+        try {
+            & az @Arguments > $TempStdOut 2> $TempStdErr
+            $ExitCode = $LASTEXITCODE
 
-        $Result = @{
-            Success     = ($ExitCode -eq 0) -or $IgnoreExitCode
-            ExitCode    = $ExitCode
-            StdOut      = if ($StdOutContent) { $StdOutContent.Trim() } else { "" }
-            StdErr      = if ($StdErrContent) { $StdErrContent.Trim() } else { "" }
-            ErrorDetail = ""
+            $StdOutContent = if (Test-Path $TempStdOut) { Get-Content $TempStdOut -Raw -ErrorAction SilentlyContinue } else { "" }
+            $StdErrContent = if (Test-Path $TempStdErr) { Get-Content $TempStdErr -Raw -ErrorAction SilentlyContinue } else { "" }
+
+            $Result = @{
+                Success     = ($ExitCode -eq 0) -or $IgnoreExitCode
+                ExitCode    = $ExitCode
+                StdOut      = if ($StdOutContent) { $StdOutContent.Trim() } else { "" }
+                StdErr      = if ($StdErrContent) { $StdErrContent.Trim() } else { "" }
+                ErrorDetail = ""
+            }
+
+            if ($ExitCode -ne 0 -and -not $IgnoreExitCode) {
+                $Result.ErrorDetail = Get-AzErrorDetail -StderrOutput $Result.StdErr -StdoutOutput $Result.StdOut
+            }
+
+            # If succeeded or no retries configured, return immediately
+            if ($Result.Success -or $Attempt -ge $MaxRetries) {
+                return $Result
+            }
+
+            # Check if the error is transient and worth retrying
+            $FullError = "$($Result.StdErr) $($Result.ErrorDetail)"
+            if ($FullError -match $TransientPattern) {
+                $Attempt++
+                $Delay = $RetryDelaySeconds * [Math]::Pow(2, $Attempt - 1)
+                Write-Log "  Transient error detected. Retry $Attempt/$MaxRetries — waiting ${Delay}s..." "WARN"
+                Start-Sleep -Seconds $Delay
+                continue
+            }
+
+            # Non-transient error — return immediately, no retry
+            return $Result
+        } finally {
+            Remove-Item $TempStdOut -ErrorAction SilentlyContinue
+            Remove-Item $TempStdErr -ErrorAction SilentlyContinue
         }
-
-        if ($ExitCode -ne 0 -and -not $IgnoreExitCode) {
-            $Result.ErrorDetail = Get-AzErrorDetail -StderrOutput $Result.StdErr -StdoutOutput $Result.StdOut
-        }
-
-        return $Result
-    } finally {
-        Remove-Item $TempStdOut -ErrorAction SilentlyContinue
-        Remove-Item $TempStdErr -ErrorAction SilentlyContinue
     }
 }
 
@@ -718,7 +751,7 @@ try {
                     $AccountStatus = "DryRun"
                 } else {
                     Write-Log "  Creating storage account '$DestAccountName'..." "" $Progress
-                    $CreateResult = Invoke-AzCommand -Arguments $CreateArgs
+                    $CreateResult = Invoke-AzCommand -Arguments $CreateArgs -MaxRetries 2
                     if (-not $CreateResult.Success) {
                         $ErrorMsg = $CreateResult.ErrorDetail
 
@@ -727,7 +760,7 @@ try {
                             Write-Log "  Access tier '$SourceAccessTier' not supported for this account type. Retrying without --access-tier..." "WARN" $Progress
                             $CreateArgs = $CreateArgs | Where-Object { $_ -ne "--access-tier" -and $_ -ne $SourceAccessTier }
                             $SkipAccessTier = $true
-                            $CreateResult = Invoke-AzCommand -Arguments $CreateArgs
+                            $CreateResult = Invoke-AzCommand -Arguments $CreateArgs -MaxRetries 2
                             if (-not $CreateResult.Success) {
                                 $ErrorMsg = $CreateResult.ErrorDetail
                                 Write-Log "  FAILED to create '$DestAccountName': $ErrorMsg" "ERROR" $Progress

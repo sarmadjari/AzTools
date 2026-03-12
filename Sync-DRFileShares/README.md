@@ -57,7 +57,7 @@ By using this script, you accept full responsibility for:
 - Permissions: Contributor or Storage Account Contributor on both source and destination subscriptions
 - **Storage Account Key Operator Service Role** (or Contributor) on both source and destination for key retrieval and SAS token generation
 - Both source and destination accounts must have `allowSharedKeyAccess` enabled (the script detects and reports this clearly if disabled)
-- **Both source and destination accounts must already exist** — use `Create-DRFileShareAccounts.ps1` to create them first
+- **Both source and destination storage accounts must already exist** — use `Create-DRFileShareAccounts.ps1` to create them first. Missing file shares on the destination are auto-created by the sync script.
 
 ## CSV Format
 
@@ -156,6 +156,33 @@ Prerequisites (Azure CLI, AzCopy, PowerShell 7) are automatically installed on t
 
 To change the sync frequency, re-run `Setup-SyncAutomation.ps1` with a different `-ScheduleIntervalHours` value.
 
+### Updating the CSV After Deployment
+
+When you add or remove storage accounts from the CSV after the Automation Account and Hybrid Worker are already deployed, you need to update the `SyncCSVContent` Automation Variable with the new CSV content. There are two ways:
+
+**Option 1 — Re-run Setup-SyncAutomation.ps1 (recommended)**
+
+```powershell
+./Setup-SyncAutomation.ps1 `
+    -AutomationAccountName "aa-dr-sync" `
+    -ResourceGroupName "rg-automation" `
+    -Location "switzerlandnorth" `
+    -CsvPath "./resources-updated.csv" `
+    -HybridWorkerGroup "my-worker-group"
+```
+
+The script is idempotent — it skips everything that already exists (Automation Account, VM, schedule, RBAC) and only overwrites the `SyncCSVContent` variable with the new CSV content. If the updated CSV references **new resource groups**, the script also assigns the required RBAC (`Storage Account Contributor`) on those new scopes automatically.
+
+**Option 2 — Update only the variable (quick, no RBAC)**
+
+If you are only removing accounts, or the new accounts are in resource groups that already have RBAC, you can update just the variable directly:
+
+**Azure Portal → Automation Account → Variables → `SyncCSVContent` → Edit → paste the new CSV content → Save**
+
+> **Note:** If the new CSV references resource groups that were not in the original CSV, the Managed Identity will not have permissions on them and the sync will fail for those accounts. In that case, use Option 1.
+
+The change takes effect immediately — the next scheduled Runbook execution reads `SyncCSVContent` fresh every time it runs. No restart or redeployment is needed.
+
 ## Pre-Validation
 
 Before any Azure operations begin, the script validates **all rows** in the CSV upfront:
@@ -178,6 +205,7 @@ For each row in the CSV:
 | 2 | Validate source account exists, check `allowSharedKeyAccess`, capture firewall settings |
 | 3 | Look up destination account — fail if not found, check `allowSharedKeyAccess`, capture firewall settings |
 | 4 | List source file shares via **ARM REST API** (bypasses source firewall) |
+| 4b | List destination file shares — **auto-create** any source shares missing on the destination (via `az storage share-rm create`, matching quota and access tier) |
 | 5 | Generate SAS tokens (4h expiry) for both accounts via management plane |
 | 6 | Temporarily open source firewall if restrictive (for AzCopy data transfer) |
 | 7 | Temporarily open dest firewall if restrictive (for AzCopy data transfer) |
@@ -219,7 +247,7 @@ The script is designed for repeated execution:
 - **Unchanged files** are skipped by `azcopy sync` (fast re-runs)
 - **Firewalls** are always restored, even on error
 - **SAS tokens** are cleaned up in every code path
-- **No side effects** — the script only syncs data, never creates/deletes accounts or shares
+- **New shares auto-created** — if a share exists on source but not on destination, it is created automatically with matching quota and access tier before syncing
 
 ## Output
 
@@ -233,6 +261,7 @@ The script exports a timestamped results CSV: `DRFileShareSyncResults_YYYYMMDD_H
 | `DestAccount` | Destination storage account name |
 | `DestResourceGroup` | Destination resource group |
 | `DestSubscription` | Destination subscription ID |
+| `SharesCreated` | Number of missing shares auto-created on destination |
 | `SharesSynced` | Number of shares successfully synced |
 | `SharesFailed` | Number of shares that failed to sync |
 | `SyncMode` | `Additive` or `Mirror` |

@@ -231,6 +231,7 @@ The script handles common issues automatically instead of failing:
 
 | Issue | How it's handled |
 |---|---|
+| **Transient network/proxy errors** | Auto-retries with exponential backoff (up to 2 retries, 15s → 30s delay). Covers proxy failures, connection timeouts, Azure throttling (429), and 502/503/504 gateway errors. |
 | **Access tier not supported** | Auto-retries without `--access-tier` when the source account type doesn't support it (Premium, FileStorage, BlockBlobStorage, Storage v1). Account is created successfully. |
 | **Storage account name globally taken** | Checks name availability (`az storage account check-name`) before creating. Fails fast with a clear message instead of hitting the Azure API error. |
 | **Failed to retrieve source key** | Skips data copy gracefully — account and shares are still created. Status shows `CreatedNoCopy` or `ExistsNoCopy`. Fix RBAC and re-run to copy data. |
@@ -243,6 +244,7 @@ The script handles common issues automatically instead of failing:
 | `Name globally unavailable` | Destination name already exists in another subscription | Use a different destination name in the CSV |
 | `allowSharedKeyAccess=false` | Source account has shared key access disabled by policy | Enable shared key access on the source account, or contact your security team. Re-run the script to copy data. |
 | `Failed to retrieve key for source account` | Missing RBAC permissions for key listing | Assign **Storage Account Key Operator Service Role** or **Contributor** on the source resource group. Re-run the script to copy data. |
+| `Cannot connect to proxy` / `407 Proxy Authorization Required` | Corporate proxy blocking the Azure CLI connection | Verify proxy settings (`HTTP_PROXY` / `HTTPS_PROXY`), authenticate to the proxy, or run from a machine with direct Azure access. The script retries transient proxy errors automatically (up to 2 retries). |
 | `AzCopy failed (exit code: N)` | Data-plane copy failure | Check: firewall timing (wait and retry), private endpoints blocking public copy, or share-level permissions |
 | `AZURE POLICY VIOLATION` | Azure Policy blocking account creation | Check the policy name and assignment in the error message; work with your governance team |
 

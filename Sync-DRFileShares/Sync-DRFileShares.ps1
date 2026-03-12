@@ -36,8 +36,14 @@
 
     The script is idempotent — safe to re-run at any frequency.
 
-    IMPORTANT: This script does NOT create storage accounts or file shares. Both must
-    already exist. Use Create-DRFileShareAccounts.ps1 for initial DR setup.
+    If a source file share does not yet exist on the destination, it is automatically
+    created (via ARM API) with the same quota and access tier before syncing. This
+    means new shares added to source accounts after the initial DR setup are picked
+    up automatically on the next sync run.
+
+    IMPORTANT: This script does NOT create storage accounts. Both source and
+    destination accounts must already exist. Use Create-DRFileShareAccounts.ps1
+    for initial DR setup.
 
 .PARAMETER CsvPath
     Path to CSV with headers: SourceResourceId, DestStorageAccountName, DestResourceGroupName.
@@ -532,6 +538,7 @@ try {
     # ── Results tracking ──────────────────────────────────────────
     $Results = @()
     $RowNum = 0
+    $TotalSharesCreated = 0
     $TotalSharesSynced = 0
     $TotalSharesFailed = 0
     $RowsSkipped = 0
@@ -550,6 +557,7 @@ try {
         $DestKey = $null
         $SourceSas = $null
         $DestSas = $null
+        $SharesCreatedThisRow = 0
         $SharesSyncedThisRow = 0
         $SharesFailedThisRow = 0
 
@@ -580,11 +588,12 @@ try {
             # ── Step 3: Look up destination account ──
             Write-Log "  Looking up destination: $DestAccountName..." "" $Progress
             az account set --subscription $DestSubId | Out-Null
-            $DestCheck = az storage account show --name $DestAccountName --resource-group $DestRGName --query "{name:name, defaultAction:networkRuleSet.defaultAction, publicNetworkAccess:publicNetworkAccess, allowSharedKeyAccess:allowSharedKeyAccess}" -o json 2>$null
+            $DestCheck = az storage account show --name $DestAccountName --resource-group $DestRGName --query "{name:name, kind:kind, defaultAction:networkRuleSet.defaultAction, publicNetworkAccess:publicNetworkAccess, allowSharedKeyAccess:allowSharedKeyAccess}" -o json 2>$null
             if (-not $DestCheck) {
                 throw "Destination account '$DestAccountName' not found in RG '$DestRGName' (sub: $DestSubId). Create it first using Create-DRFileShareAccounts.ps1."
             }
             $DestProps = $DestCheck | ConvertFrom-Json
+            $DestKind            = if ($DestProps.kind) { $DestProps.kind } else { "StorageV2" }
             $DestDefaultAction   = if ($DestProps.defaultAction) { $DestProps.defaultAction } else { "Allow" }
             $DestPublicAccess    = if ($DestProps.publicNetworkAccess) { $DestProps.publicNetworkAccess } else { "Enabled" }
             $DestAllowSharedKey  = if ($null -ne $DestProps.allowSharedKeyAccess) { $DestProps.allowSharedKeyAccess } else { $true }
@@ -595,13 +604,20 @@ try {
             $ArmSharesUrl = "https://management.azure.com/subscriptions/$($Source.SubscriptionId)/resourceGroups/$($Source.ResourceGroup)/providers/Microsoft.Storage/storageAccounts/$($Source.AccountName)/fileServices/default/shares?api-version=2023-05-01"
             $ArmSharesJson = az rest --method GET --url $ArmSharesUrl -o json 2>$null
 
-            $SourceShares = @()
+            $SourceShareDetails = @()
             if ($ArmSharesJson) {
                 $ArmSharesObj = $ArmSharesJson | ConvertFrom-Json
                 if ($ArmSharesObj.value) {
-                    $SourceShares = @($ArmSharesObj.value | ForEach-Object { $_.name })
+                    $SourceShareDetails = @($ArmSharesObj.value | ForEach-Object {
+                        @{
+                            Name       = $_.name
+                            Quota      = $_.properties.shareQuota
+                            AccessTier = $_.properties.accessTier
+                        }
+                    })
                 }
             }
+            $SourceShares = @($SourceShareDetails | ForEach-Object { $_.Name })
 
             $ShareCount = $SourceShares.Count
             Write-Log "  Found $ShareCount file share(s) on source." "" $Progress
@@ -615,6 +631,46 @@ try {
                     SyncMode=$SyncMode; Status="Skipped"; Notes="No file shares on source"
                 }
                 continue
+            }
+
+            # ── Step 4b: Auto-create missing destination shares via ARM API ──
+            az account set --subscription $DestSubId | Out-Null
+            $DestArmSharesUrl = "https://management.azure.com/subscriptions/$DestSubId/resourceGroups/$DestRGName/providers/Microsoft.Storage/storageAccounts/$DestAccountName/fileServices/default/shares?api-version=2023-05-01"
+            $DestArmSharesJson = az rest --method GET --url $DestArmSharesUrl -o json 2>$null
+            $DestShares = @()
+            if ($DestArmSharesJson) {
+                $DestArmSharesObj = $DestArmSharesJson | ConvertFrom-Json
+                if ($DestArmSharesObj.value) {
+                    $DestShares = @($DestArmSharesObj.value | ForEach-Object { $_.name })
+                }
+            }
+
+            $MissingShares = @($SourceShareDetails | Where-Object { $_.Name -notin $DestShares })
+            if ($MissingShares.Count -gt 0) {
+                Write-Log "  $($MissingShares.Count) share(s) missing on destination. Auto-creating via ARM API..." "" $Progress
+                foreach ($MissingShare in $MissingShares) {
+                    $ShareCreateArgs = @(
+                        "storage", "share-rm", "create",
+                        "--storage-account", $DestAccountName,
+                        "--resource-group", $DestRGName,
+                        "--name", $MissingShare.Name,
+                        "--quota", $MissingShare.Quota.ToString(),
+                        "-o", "none"
+                    )
+                    # Access tier only for non-FileStorage (FileStorage shares are always Premium)
+                    if ($DestKind -ne "FileStorage" -and $MissingShare.AccessTier) {
+                        $ShareCreateArgs += @("--access-tier", $MissingShare.AccessTier)
+                    }
+
+                    if ($DryRun) {
+                        Write-Log "    [DRYRUN] Would create share: $($MissingShare.Name) (quota=$($MissingShare.Quota)GB)" "DRYRUN" $Progress
+                    } else {
+                        az @ShareCreateArgs 2>$null | Out-Null
+                        Write-Log "    Share created: $($MissingShare.Name) (quota=$($MissingShare.Quota)GB)" "SUCCESS" $Progress
+                    }
+                    $SharesCreatedThisRow++
+                    $TotalSharesCreated++
+                }
             }
 
             # ── DryRun path ──
@@ -766,6 +822,7 @@ try {
                 DestAccount      = $DestAccountName
                 DestResourceGroup = $DestRGName
                 DestSubscription = $DestSubId
+                SharesCreated    = $SharesCreatedThisRow
                 SharesSynced     = $SharesSyncedThisRow
                 SharesFailed     = $SharesFailedThisRow
                 SyncMode         = $SyncMode
@@ -832,6 +889,9 @@ try {
     Write-Log "=================================================================="
     Write-Log "  Total rows processed         : $RowNum of $TotalRows"
     Write-Log "  SyncMode                     : $SyncMode"
+    if ($TotalSharesCreated -gt 0) {
+        Write-Log "  Total shares created         : $TotalSharesCreated" "SUCCESS"
+    }
     Write-Log "  Total shares synced          : $TotalSharesSynced"
     Write-Log "  Total shares failed          : $TotalSharesFailed"
     Write-Log "  Rows skipped                 : $RowsSkipped"
