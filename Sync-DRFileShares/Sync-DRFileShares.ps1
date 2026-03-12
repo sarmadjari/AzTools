@@ -89,11 +89,18 @@
     otherwise, arising from, out of, or in connection with this script or the use
     or other dealings in this script.
 
-    This script is shared strictly as a proof-of-concept (POC) for testing and
-    evaluation purposes only. Use against production environments is entirely at
-    your own risk.
+    This script is shared strictly as a proof-of-concept (POC) / sample code for
+    testing and evaluation purposes only. Use against production environments is
+    entirely at your own risk.
+
+    NO SUPPORT OR MAINTENANCE OBLIGATION
+    The author(s) are under no obligation to provide support, maintenance, updates,
+    enhancements, or bug fixes. No obligation exists to respond to issues, feature
+    requests, or pull requests. If this script requires modifications for your
+    environment, you are solely responsible for implementing them.
 
     By using this script, you accept full responsibility for:
+      - Determining whether this script is suitable for your intended use case
       - Reviewing and customising the script to meet your specific environment
       - Validating storage account pairs and file share mappings against your
         organisational standards
@@ -106,6 +113,9 @@
         production storage accounts
       - Following your organisation's approved change management, deployment, and
         operational practices
+      - All outcomes resulting from the use of this script, including but not limited
+        to data loss, service disruption, security incidents, compliance violations,
+        or financial impact
 
     Always run with -DryRun first to review planned changes before executing live.
     Use -SyncMode "Additive" (default) unless you explicitly need deletion propagation.
