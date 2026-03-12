@@ -20,6 +20,10 @@
       - Compares source vs destination and transfers only changed files
       - Much faster on subsequent runs than azcopy copy (skips unchanged files)
       - Optionally propagates deletions with Mirror mode
+      - SMB metadata (timestamps, attributes) always preserved (--preserve-smb-info=true)
+      - SMB permissions (NTFS ACLs) opt-in via -PreserveSmbPermissions (off by default
+        for performance — avoids ~2 extra API calls per file on subsequent syncs)
+      - Uses --log-level=ERROR by default to reduce AzCopy internal log I/O on large jobs
 
     SyncMode options:
       - Additive (default): Syncs new and changed files. Never deletes files on the
@@ -60,6 +64,19 @@
     Mirror   = sync changes + delete files on destination that don't exist on source.
     In Automation mode, falls back to the SyncMode Automation Variable.
 
+.PARAMETER PreserveSmbPermissions
+    Switch. Opt-in. Preserves NTFS ACLs (--preserve-smb-permissions=true). Off by default
+    for faster subsequent syncs — avoids ~2 extra API calls per file. Recommended for initial
+    sync or when permissions have changed. SMB metadata (timestamps, attributes) is always
+    preserved regardless of this switch.
+    In Automation mode, falls back to the PreserveSmbPermissions Automation Variable.
+
+.PARAMETER ExcludePattern
+    Semicolon-delimited glob pattern passed to AzCopy --exclude-pattern. Files matching
+    the pattern are skipped during sync. Useful for excluding locked, in-use, or temporary
+    files that consistently fail. Example: "*.tmp;~$*;thumbs.db"
+    In Automation mode, falls back to the ExcludePattern Automation Variable.
+
 .PARAMETER DryRun
     Switch. Dry run — shows what would be synced without making changes.
 
@@ -79,10 +96,22 @@
     # Cross-subscription
     .\Sync-DRFileShares.ps1 -CsvPath ".\resources.csv" -DestSubscriptionId "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
 
+.EXAMPLE
+    # Sync with NTFS ACL preservation (initial sync or after permission changes)
+    .\Sync-DRFileShares.ps1 -CsvPath ".\resources.csv" -PreserveSmbPermissions
+
+.EXAMPLE
+    # Skip temp and locked files
+    .\Sync-DRFileShares.ps1 -CsvPath ".\resources.csv" -ExcludePattern "*.tmp;~$*;thumbs.db"
+
+.EXAMPLE
+    # Full sync with permissions and exclusions
+    .\Sync-DRFileShares.ps1 -CsvPath ".\resources.csv" -PreserveSmbPermissions -ExcludePattern "*.tmp;~$*"
+
 .NOTES
     Author  : Sarmad Jari
-    Version : 2.0
-    Date    : 2026-03-11
+    Version : 2.1
+    Date    : 2026-03-12
     License : MIT License (https://opensource.org/licenses/MIT)
 
     DISCLAIMER
@@ -149,6 +178,8 @@ param (
     [Parameter(Mandatory=$false)][string]$CsvPath,
     [Parameter(Mandatory=$false)][string]$DestSubscriptionId,
     [Parameter(Mandatory=$false)][ValidateSet("Additive","Mirror")][string]$SyncMode = "Additive",
+    [switch]$PreserveSmbPermissions,
+    [string]$ExcludePattern,
     [switch]$DryRun
 )
 
@@ -363,6 +394,58 @@ function Format-Duration {
     }
 }
 
+function Parse-AzCopyOutput {
+    <#
+    .SYNOPSIS
+        Parses AzCopy stdout/stderr to extract transfer statistics.
+        Returns a PSCustomObject with transfer counts and bytes.
+    #>
+    param([string[]]$Output)
+
+    $Stats = [PSCustomObject]@{
+        FinalJobStatus     = "Unknown"
+        TransfersCompleted = 0
+        TransfersFailed    = 0
+        TransfersSkipped   = 0
+        TotalTransfers     = 0
+        BytesTransferred   = 0
+    }
+
+    if (-not $Output) { return $Stats }
+
+    foreach ($Line in $Output) {
+        if ($Line -match "Final Job Status:\s*(.+)") {
+            $Stats.FinalJobStatus = $Matches[1].Trim()
+        }
+        elseif ($Line -match "Number of File Transfers:\s*(\d+)") {
+            $Stats.TransfersCompleted = [int]$Matches[1]
+        }
+        elseif ($Line -match "Number of Transfers Completed:\s*(\d+)") {
+            $Stats.TransfersCompleted = [int]$Matches[1]
+        }
+        elseif ($Line -match "Number of File Transfers Failed:\s*(\d+)") {
+            $Stats.TransfersFailed = [int]$Matches[1]
+        }
+        elseif ($Line -match "Number of Transfers Failed:\s*(\d+)") {
+            $Stats.TransfersFailed = [int]$Matches[1]
+        }
+        elseif ($Line -match "Number of File Transfers Skipped:\s*(\d+)") {
+            $Stats.TransfersSkipped = [int]$Matches[1]
+        }
+        elseif ($Line -match "Number of Transfers Skipped:\s*(\d+)") {
+            $Stats.TransfersSkipped = [int]$Matches[1]
+        }
+        elseif ($Line -match "Total Number of Transfers:\s*(\d+)") {
+            $Stats.TotalTransfers = [int]$Matches[1]
+        }
+        elseif ($Line -match "TotalBytesTransferred:\s*(\d+)") {
+            $Stats.BytesTransferred = [long]$Matches[1]
+        }
+    }
+
+    return $Stats
+}
+
 # ── Temp file for cleanup tracking ────────────────────────────────
 $TempCsvPath = $null
 
@@ -427,8 +510,26 @@ try {
             }
         }
 
-        Write-Log "  SyncMode           : $SyncMode"
-        Write-Log "  DestSubscriptionId : $(if ($DestSubscriptionId) { $DestSubscriptionId } else { '(same as source)' })"
+        # PreserveSmbPermissions: CLI switch takes priority, then Automation Variable
+        if (-not $PreserveSmbPermissions) {
+            $VarPreservePerms = Get-AutomationVariable -Name 'PreserveSmbPermissions'
+            if (-not [string]::IsNullOrWhiteSpace($VarPreservePerms) -and $VarPreservePerms -eq "true") {
+                $PreserveSmbPermissions = [switch]::Present
+            }
+        }
+
+        # ExcludePattern: CLI parameter takes priority, then Automation Variable
+        if ([string]::IsNullOrWhiteSpace($ExcludePattern)) {
+            $VarExclude = Get-AutomationVariable -Name 'ExcludePattern'
+            if (-not [string]::IsNullOrWhiteSpace($VarExclude)) {
+                $ExcludePattern = $VarExclude
+            }
+        }
+
+        Write-Log "  SyncMode               : $SyncMode"
+        Write-Log "  DestSubscriptionId     : $(if ($DestSubscriptionId) { $DestSubscriptionId } else { '(same as source)' })"
+        Write-Log "  PreserveSmbPermissions : $PreserveSmbPermissions"
+        Write-Log "  ExcludePattern         : $(if ($ExcludePattern) { $ExcludePattern } else { '(none)' })"
     }
 
     # ── Validate CSV ──────────────────────────────────────────────
@@ -529,10 +630,12 @@ try {
     }
 
     Write-Log "=================================================================="
-    Write-Log "  SyncMode : $SyncMode"
+    Write-Log "  SyncMode               : $SyncMode"
     if ($SyncMode -eq "Mirror") {
-        Write-Log "  WARNING  : Mirror mode will DELETE files on dest not in source" "WARN"
+        Write-Log "  WARNING                : Mirror mode will DELETE files on dest not in source" "WARN"
     }
+    Write-Log "  PreserveSmbPermissions : $PreserveSmbPermissions"
+    Write-Log "  ExcludePattern         : $(if ($ExcludePattern) { $ExcludePattern } else { '(none)' })"
     Write-Log "=================================================================="
 
     # ── Results tracking ──────────────────────────────────────────
@@ -540,6 +643,7 @@ try {
     $RowNum = 0
     $TotalSharesCreated = 0
     $TotalSharesSynced = 0
+    $TotalSharesPartial = 0
     $TotalSharesFailed = 0
     $RowsSkipped = 0
     $RowsFailed = 0
@@ -559,6 +663,7 @@ try {
         $DestSas = $null
         $SharesCreatedThisRow = 0
         $SharesSyncedThisRow = 0
+        $SharesPartialThisRow = 0
         $SharesFailedThisRow = 0
 
         try {
@@ -683,7 +788,11 @@ try {
                     Write-Log "  [DRYRUN] Would temporarily open dest firewall (defaultAction=$DestDefaultAction, publicAccess=$DestPublicAccess)" "DRYRUN" $Progress
                 }
                 foreach ($ShareName in $SourceShares) {
-                    Write-Log "  [DRYRUN] Would azcopy sync share: $ShareName (SyncMode: $SyncMode)" "DRYRUN" $Progress
+                    $DryRunFlags = "--preserve-smb-info=true --recursive=true --log-level=ERROR"
+                    if ($PreserveSmbPermissions) { $DryRunFlags += " --preserve-smb-permissions=true" }
+                    if ($SyncMode -eq "Mirror") { $DryRunFlags += " --delete-destination=true" }
+                    if (-not [string]::IsNullOrWhiteSpace($ExcludePattern)) { $DryRunFlags += " --exclude-pattern=$ExcludePattern" }
+                    Write-Log "  [DRYRUN] Would azcopy sync share: $ShareName ($DryRunFlags)" "DRYRUN" $Progress
                 }
                 if ($SourceDefaultAction -eq "Deny" -or $SourcePublicAccess -eq "Disabled") {
                     Write-Log "  [DRYRUN] Would restore source firewall" "DRYRUN" $Progress
@@ -694,7 +803,7 @@ try {
 
                 $Results += [PSCustomObject]@{
                     SourceAccount=$Source.AccountName; DestAccount=$DestAccountName; DestResourceGroup=$DestRGName
-                    DestSubscription=$DestSubId; SharesSynced=$ShareCount; SharesFailed=0
+                    DestSubscription=$DestSubId; SharesSynced=$ShareCount; SharesPartial=0; SharesFailed=0
                     SyncMode=$SyncMode; Status="DryRun"; Notes=""
                 }
                 $RowElapsed = (Get-Date) - $RowStartTime
@@ -757,24 +866,47 @@ try {
                         "sync",
                         $SourceUrl,
                         $DestUrl,
-                        "--preserve-smb-permissions=true",
                         "--preserve-smb-info=true",
-                        "--recursive=true"
+                        "--recursive=true",
+                        "--log-level=ERROR"
                     )
+
+                    if ($PreserveSmbPermissions) {
+                        $azCopyArgs += "--preserve-smb-permissions=true"
+                    }
 
                     # Mirror mode: propagate deletions
                     if ($SyncMode -eq "Mirror") {
                         $azCopyArgs += "--delete-destination=true"
                     }
 
-                    & azcopy $azCopyArgs
+                    if (-not [string]::IsNullOrWhiteSpace($ExcludePattern)) {
+                        $azCopyArgs += "--exclude-pattern=$ExcludePattern"
+                    }
 
-                    if ($LASTEXITCODE -eq 0) {
-                        Write-Log "    Share synced: $ShareName" "SUCCESS" $Progress
+                    # Capture output for parsing and logging
+                    $azOutput = & azcopy $azCopyArgs 2>&1 | ForEach-Object { $_.ToString() }
+                    $azExitCode = $LASTEXITCODE
+
+                    # Stream captured output to log
+                    foreach ($azLine in $azOutput) {
+                        Write-Log "    [azcopy] $azLine" "" $Progress
+                    }
+
+                    # Parse transfer stats from AzCopy output
+                    $azStats = Parse-AzCopyOutput $azOutput
+
+                    if ($azExitCode -eq 0) {
+                        Write-Log "    Share synced: $ShareName ($($azStats.TransfersCompleted) files transferred)" "SUCCESS" $Progress
                         $SharesSyncedThisRow++
                         $TotalSharesSynced++
+                    } elseif ($azExitCode -eq 1) {
+                        # Exit code 1 = partial success (some files transferred, some failed)
+                        Write-Log "    Share partially synced: $ShareName ($($azStats.TransfersCompleted) transferred, $($azStats.TransfersFailed) failed, $($azStats.TransfersSkipped) skipped)" "WARN" $Progress
+                        $SharesPartialThisRow++
+                        $TotalSharesPartial++
                     } else {
-                        Write-Log "    AzCopy failed for share '$ShareName' (exit code: $LASTEXITCODE). Check: firewall timing, private endpoints blocking public copy, or share-level permissions." "WARN" $Progress
+                        Write-Log "    AzCopy failed for share '$ShareName' (exit code: $azExitCode). Check: firewall timing, private endpoints blocking public copy, or share-level permissions." "WARN" $Progress
                         $SharesFailedThisRow++
                         $TotalSharesFailed++
                     }
@@ -811,8 +943,8 @@ try {
             }
 
             # ── Step 11: Record results ──
-            $RowStatus = if ($SharesFailedThisRow -eq 0) { "Completed" }
-                         elseif ($SharesSyncedThisRow -gt 0) { "PartialFailure" }
+            $RowStatus = if ($SharesFailedThisRow -eq 0 -and $SharesPartialThisRow -eq 0) { "Completed" }
+                         elseif ($SharesSyncedThisRow -gt 0 -or $SharesPartialThisRow -gt 0) { "PartialSync" }
                          else { "Failed" }
 
             if ($RowStatus -eq "Failed") { $RowsFailed++ }
@@ -824,6 +956,7 @@ try {
                 DestSubscription = $DestSubId
                 SharesCreated    = $SharesCreatedThisRow
                 SharesSynced     = $SharesSyncedThisRow
+                SharesPartial    = $SharesPartialThisRow
                 SharesFailed     = $SharesFailedThisRow
                 SyncMode         = $SyncMode
                 Status           = $RowStatus
@@ -862,6 +995,7 @@ try {
                 DestResourceGroup = if ($DestRGName) { $DestRGName } else { "N/A" }
                 DestSubscription = if ($DestSubId) { $DestSubId } else { "N/A" }
                 SharesSynced = 0
+                SharesPartial = 0
                 SharesFailed = 0
                 SyncMode = $SyncMode
                 Status = "Failed"
@@ -893,6 +1027,9 @@ try {
         Write-Log "  Total shares created         : $TotalSharesCreated" "SUCCESS"
     }
     Write-Log "  Total shares synced          : $TotalSharesSynced"
+    if ($TotalSharesPartial -gt 0) {
+        Write-Log "  Total shares partial         : $TotalSharesPartial" "WARN"
+    }
     Write-Log "  Total shares failed          : $TotalSharesFailed"
     Write-Log "  Rows skipped                 : $RowsSkipped"
     Write-Log "  Rows failed                  : $RowsFailed"
@@ -902,22 +1039,23 @@ try {
     }
     Write-Log "=================================================================="
 
-    # Failed rows detail
-    $FailedResults = @($Results | Where-Object { $_.Status -eq "Failed" -or $_.Status -eq "PartialFailure" })
-    if ($FailedResults.Count -gt 0) {
+    # Failed/partial rows detail
+    $IssueResults = @($Results | Where-Object { $_.Status -eq "Failed" -or $_.Status -eq "PartialSync" })
+    if ($IssueResults.Count -gt 0) {
         Write-Log ""
-        Write-Log "  FAILED DETAIL:" "ERROR"
-        Write-Log "  ----------------------------------------------------------" "ERROR"
-        foreach ($F in $FailedResults) {
-            Write-Log "  $($F.SourceAccount) -> $($F.DestAccount): $($F.Status)" "ERROR"
+        Write-Log "  ISSUE DETAIL:" "WARN"
+        Write-Log "  ----------------------------------------------------------" "WARN"
+        foreach ($F in $IssueResults) {
+            $IssueLevel = if ($F.Status -eq "Failed") { "ERROR" } else { "WARN" }
+            Write-Log "  $($F.SourceAccount) -> $($F.DestAccount): $($F.Status)" $IssueLevel
             if ($F.Notes) {
-                Write-Log "    Reason: $($F.Notes)" "ERROR"
+                Write-Log "    Reason: $($F.Notes)" $IssueLevel
             }
-            if ($F.SharesFailed -gt 0) {
-                Write-Log "    Shares synced: $($F.SharesSynced), failed: $($F.SharesFailed)" "ERROR"
+            if ($F.SharesFailed -gt 0 -or $F.SharesPartial -gt 0) {
+                Write-Log "    Shares synced: $($F.SharesSynced), partial: $($F.SharesPartial), failed: $($F.SharesFailed)" $IssueLevel
             }
         }
-        Write-Log "  ----------------------------------------------------------" "ERROR"
+        Write-Log "  ----------------------------------------------------------" "WARN"
     }
 
     Write-Log "=================================================================="

@@ -2,9 +2,9 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
-**Author:** Sarmad Jari | **Version:** 2.0 | **Date:** 2026-03-11
+**Author:** Sarmad Jari | **Version:** 2.1 | **Date:** 2026-03-12
 
-Syncs Azure File Shares from source to destination storage accounts using `azcopy sync`. Compares source vs destination and transfers only changed files — much faster on subsequent runs than `azcopy copy`. Supports Additive (default, no deletes) and Mirror (syncs deletions) modes.
+Syncs Azure File Shares from source to destination storage accounts using `azcopy sync`. Compares source vs destination and transfers only changed files — much faster on subsequent runs than `azcopy copy`. Supports Additive (default, no deletes) and Mirror (syncs deletions) modes. Optimized for large file shares: SMB permissions are opt-in (`-PreserveSmbPermissions`), AzCopy uses `--log-level=ERROR` to reduce I/O, and partial syncs (AzCopy exit code 1) are tracked separately from total failures.
 
 Data flows directly between Azure storage endpoints (server-side copy) — nothing passes through the client machine.
 
@@ -85,6 +85,8 @@ All parameters are optional. In Automation mode, values fall back to Automation 
 | `-CsvPath` | Manual: Yes | Path to the CSV mapping file. In Automation mode, falls back to `SyncCSVContent` Automation Variable |
 | `-DestSubscriptionId` | No | Destination subscription ID. Defaults to the source subscription. In Automation mode, falls back to `DestSubscriptionId` Automation Variable |
 | `-SyncMode` | No | `Additive` (default) or `Mirror`. In Automation mode, falls back to `SyncMode` Automation Variable |
+| `-PreserveSmbPermissions` | No | Opt-in. Preserves NTFS ACLs (`--preserve-smb-permissions=true`). Off by default for faster subsequent syncs — avoids ~2 extra API calls per file. SMB metadata (timestamps, attributes) is always preserved. In Automation mode, falls back to `PreserveSmbPermissions` Automation Variable |
+| `-ExcludePattern` | No | Semicolon-delimited glob pattern to skip files (`--exclude-pattern`). Example: `"*.tmp;~$*;thumbs.db"`. In Automation mode, falls back to `ExcludePattern` Automation Variable |
 | `-DryRun` | No | Dry run — shows what would be synced without making changes |
 
 ## Sync Mode
@@ -112,6 +114,15 @@ All parameters are optional. In Automation mode, values fall back to Automation 
 
 # Cross-subscription
 ./Sync-DRFileShares.ps1 -CsvPath "./resources.csv" -DestSubscriptionId "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
+
+# Sync with NTFS ACL preservation (initial sync or after permission changes)
+./Sync-DRFileShares.ps1 -CsvPath "./resources.csv" -PreserveSmbPermissions
+
+# Skip temp and locked files that consistently fail
+./Sync-DRFileShares.ps1 -CsvPath "./resources.csv" -ExcludePattern "*.tmp;~$*;thumbs.db"
+
+# Full sync with permissions and exclusions
+./Sync-DRFileShares.ps1 -CsvPath "./resources.csv" -PreserveSmbPermissions -ExcludePattern "*.tmp;~$*"
 ```
 
 ### Automated Sync (Azure Automation + Hybrid Worker)
@@ -149,7 +160,7 @@ This creates and configures:
 | System-Assigned Managed Identity | Secure auth — no credentials stored |
 | Hybrid Runbook Worker | VM-based execution (azcopy requires a real host, not a cloud sandbox) |
 | Recurring schedule | Configurable interval (default: every 6 hours) |
-| Automation Variables | `SyncCSVContent` (encrypted), `SyncMode`, `DestSubscriptionId` |
+| Automation Variables | `SyncCSVContent` (encrypted), `SyncMode`, `DestSubscriptionId`, `PreserveSmbPermissions`, `ExcludePattern` |
 | RBAC | Storage Account Contributor on all source and destination resource groups |
 
 Prerequisites (Azure CLI, AzCopy, PowerShell 7) are automatically installed on the VM. For existing Hybrid Worker Groups (`-HybridWorkerGroup`), ensure the VM has these tools pre-installed.
@@ -226,10 +237,21 @@ For each row in the CSV:
 
 | Property | Preserved |
 |---|---|
-| SMB permissions (NTFS ACLs) | Yes (`--preserve-smb-permissions=true`) |
-| SMB metadata (timestamps, attributes) | Yes (`--preserve-smb-info=true`) |
+| SMB permissions (NTFS ACLs) | Opt-in (`-PreserveSmbPermissions`). Off by default for performance — avoids ~2 extra API calls per file when permissions haven't changed. Recommended for initial sync or after permission changes |
+| SMB metadata (timestamps, attributes) | Always (`--preserve-smb-info=true`) |
 | File content | Yes |
 | Directory structure | Yes (`--recursive=true`) |
+
+### AzCopy Performance Tuning
+
+The script applies several optimizations for large file shares (1M+ files):
+
+| Optimization | Details |
+|---|---|
+| `--log-level=ERROR` | Reduces AzCopy internal log I/O. Microsoft-recommended for large jobs where INFO-level logging creates significant disk overhead |
+| `--preserve-smb-permissions` opt-in | Off by default. Each file requires ~2 extra API calls (one on source, one on dest) to compare NTFS ACLs. On subsequent syncs where permissions haven't changed, this overhead is wasted. Use `-PreserveSmbPermissions` for initial sync or after permission changes |
+| `--exclude-pattern` | Skip files matching a semicolon-delimited glob pattern. Use `-ExcludePattern` to exclude locked, in-use, or temporary files that consistently fail and cause retries |
+| Three-way exit code handling | AzCopy exit code 0 = full success, exit code 1 = partial sync (some files transferred, some failed), exit code 2+ = total failure. Partial syncs are tracked as `PartialSync` instead of being treated as failures |
 
 ### Firewall Handling
 
@@ -262,10 +284,11 @@ The script exports a timestamped results CSV: `DRFileShareSyncResults_YYYYMMDD_H
 | `DestResourceGroup` | Destination resource group |
 | `DestSubscription` | Destination subscription ID |
 | `SharesCreated` | Number of missing shares auto-created on destination |
-| `SharesSynced` | Number of shares successfully synced |
-| `SharesFailed` | Number of shares that failed to sync |
+| `SharesSynced` | Number of shares fully synced (AzCopy exit code 0) |
+| `SharesPartial` | Number of shares partially synced (AzCopy exit code 1 — some files transferred, some failed) |
+| `SharesFailed` | Number of shares that failed to sync (AzCopy exit code 2+) |
 | `SyncMode` | `Additive` or `Mirror` |
-| `Status` | `Completed`, `PartialFailure`, `Failed`, `Skipped`, or `DryRun` |
+| `Status` | `Completed`, `PartialSync`, `Failed`, `Skipped`, or `DryRun` |
 | `Notes` | Error or skip reason |
 
 ### Automation Mode
@@ -278,7 +301,8 @@ Output goes to the Azure Automation job log (plain text). No results CSV is expo
 |---|---|---|
 | `allowSharedKeyAccess=false` | Source or destination account has shared key access disabled by policy | Enable shared key access on the account, or contact your security team |
 | `Failed to retrieve key` | Missing RBAC permissions for key listing | Assign **Storage Account Key Operator Service Role** or **Contributor** on the resource group |
-| `AzCopy failed (exit code: N)` | Data-plane sync failure | Check: firewall timing (wait and retry), private endpoints blocking public copy, or share-level permissions |
+| `Share partially synced` (exit code 1) | Some files transferred, some failed (locked files, permission issues, transient errors) | Review AzCopy logs. Use `-ExcludePattern` to skip known-problematic files. Re-run — partial syncs are safe to retry |
+| `AzCopy failed (exit code: N)` (exit code 2+) | Total data-plane sync failure | Check: firewall timing (wait and retry), private endpoints blocking public copy, or share-level permissions |
 | `Source account not found` | Source account doesn't exist or wrong subscription | Verify the ARM Resource ID in the CSV |
 | `Destination account not found` | Destination account doesn't exist yet | Run `Create-DRFileShareAccounts.ps1` first to create destination accounts |
 | `No CSV source specified` | Neither `-CsvPath` provided nor running in Automation | Provide `-CsvPath` for manual runs, or deploy via `Setup-SyncAutomation.ps1` for automation |

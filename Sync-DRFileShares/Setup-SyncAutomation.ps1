@@ -76,6 +76,16 @@
     Additive = sync changes, never delete on destination.
     Mirror   = sync changes + delete files on destination that don't exist on source.
 
+.PARAMETER PreserveSmbPermissions
+    Switch. Stored as the PreserveSmbPermissions Automation Variable. When true, the
+    Runbook passes --preserve-smb-permissions=true to AzCopy. Off by default for faster
+    subsequent syncs. Recommended for initial sync or when permissions have changed.
+
+.PARAMETER ExcludePattern
+    Semicolon-delimited glob pattern stored as the ExcludePattern Automation Variable.
+    The Runbook passes this to AzCopy --exclude-pattern to skip matching files during
+    sync. Example: "*.tmp;~$*;thumbs.db"
+
 .PARAMETER DryRun
     Switch. Dry run — shows what would be created without making changes.
 
@@ -101,8 +111,8 @@
 
 .NOTES
     Author  : Sarmad Jari
-    Version : 1.0
-    Date    : 2026-03-11
+    Version : 1.1
+    Date    : 2026-03-12
     License : MIT License (https://opensource.org/licenses/MIT)
 
     DISCLAIMER
@@ -177,6 +187,8 @@ param (
     [Parameter(Mandatory=$false)][string]$DestSubscriptionId,
     [Parameter(Mandatory=$false)][ValidateRange(1,24)][int]$ScheduleIntervalHours = 6,
     [Parameter(Mandatory=$false)][ValidateSet("Additive","Mirror")][string]$SyncMode = "Additive",
+    [switch]$PreserveSmbPermissions,
+    [string]$ExcludePattern,
     [switch]$DryRun
 )
 
@@ -1105,9 +1117,11 @@ try {
     $CsvContent = Get-Content $CsvFullPath -Raw
 
     $Variables = @(
-        @{ Name = "SyncCSVContent";     Value = $CsvContent;                                                                  Encrypted = $true  },
-        @{ Name = "SyncMode";           Value = $SyncMode;                                                                     Encrypted = $false },
-        @{ Name = "DestSubscriptionId"; Value = $(if ($DestSubscriptionId) { $DestSubscriptionId } else { "" });               Encrypted = $false }
+        @{ Name = "SyncCSVContent";          Value = $CsvContent;                                                                      Encrypted = $true  },
+        @{ Name = "SyncMode";                Value = $SyncMode;                                                                         Encrypted = $false },
+        @{ Name = "DestSubscriptionId";      Value = $(if ($DestSubscriptionId) { $DestSubscriptionId } else { "" });                   Encrypted = $false },
+        @{ Name = "PreserveSmbPermissions";  Value = $(if ($PreserveSmbPermissions) { "true" } else { "false" });                        Encrypted = $false },
+        @{ Name = "ExcludePattern";          Value = $(if ($ExcludePattern) { $ExcludePattern } else { "" });                            Encrypted = $false }
     )
 
     foreach ($Var in $Variables) {
