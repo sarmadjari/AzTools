@@ -77,22 +77,40 @@
     testing and evaluation purposes only. Use against production environments is
     entirely at your own risk.
 
+    NOT AN OFFICIAL PRODUCT
+    This script is an independent, personal work created and shared by an individual
+    to assist the community. It is NOT an official product, service, or deliverable
+    of any company, employer, or organisation. It is not endorsed, certified, vetted,
+    or supported by any company or vendor, including Microsoft. Any use of company
+    names, product names, or trademarks is solely for identification purposes and
+    does not imply affiliation, sponsorship, or endorsement.
+
     NO SUPPORT OR MAINTENANCE OBLIGATION
     The author(s) are under no obligation to provide support, maintenance, updates,
     enhancements, or bug fixes. No obligation exists to respond to issues, feature
     requests, or pull requests. If this script requires modifications for your
     environment, you are solely responsible for implementing them.
 
+    CONFIGURATION AND SETTINGS RESPONSIBILITY
+    You are solely responsible for verifying that all parameters, settings, and
+    configurations used with this script are correct and appropriate for your
+    environment. The author(s) make no guarantees that default values, example
+    configurations, or suggested settings are suitable for any specific environment.
+    Incorrect configuration may result in data loss, service disruption, security
+    vulnerabilities, or unintended changes to your Azure resources.
+
     By using this script, you accept full responsibility for:
       - Determining whether this script is suitable for your intended use case
-      - Reviewing and customising the script to meet your specific environment
-      - Validating storage account naming, SKU selections, and file share quotas
+      - Reviewing and customising the script to meet your specific environment and requirements
+      - Verifying that all parameters, settings, and configurations are correct
+        and appropriate for your environment before each execution
+      - Validating storage account naming conventions, SKU selections, and file share quotas
         against your organisational standards
       - Applying appropriate security hardening, access controls, network restrictions,
         and compliance policies to all storage accounts in both source and destination regions
       - Ensuring data residency, sovereignty, and regulatory requirements are met
         for the target region before executing any data copy
-      - Testing in lower environments (development / staging) before running against
+      - Testing and validating in lower environments (development / staging) before running against
         production storage accounts
       - Verifying data copy completeness, RPO targets, and failover procedures are fit
         for purpose prior to production use

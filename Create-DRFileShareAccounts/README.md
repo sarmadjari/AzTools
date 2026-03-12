@@ -14,12 +14,17 @@ Creates DR (Disaster Recovery) file share storage accounts from a CSV mapping fi
 
 This script is shared strictly as a **proof-of-concept (POC) / sample code** for testing and evaluation purposes only. Use against production environments is **entirely at your own risk**.
 
+**Not an Official Product:** This script is an independent, personal work created and shared by an individual to assist the community. It is **NOT** an official product, service, or deliverable of any company, employer, or organisation. It is not endorsed, certified, vetted, or supported by any company or vendor, including Microsoft. Any use of company names, product names, or trademarks is solely for identification purposes and does not imply affiliation, sponsorship, or endorsement.
+
 **No Support or Maintenance Obligation:** The author(s) are under no obligation to provide support, maintenance, updates, enhancements, or bug fixes. No obligation exists to respond to issues, feature requests, or pull requests. If this script requires modifications for your environment, you are solely responsible for implementing them.
+
+**Configuration and Settings Responsibility:** You are solely responsible for verifying that all parameters, settings, and configurations used with this script are correct and appropriate for your environment. The author(s) make no guarantees that default values, example configurations, or suggested settings are suitable for any specific environment. Incorrect configuration may result in data loss, service disruption, security vulnerabilities, or unintended changes to your Azure resources.
 
 By using this script, you accept full responsibility for:
 
 - **Determining whether this script is suitable for your intended use case**
 - Reviewing and customising the script to meet your specific environment and requirements
+- **Verifying that all parameters, settings, and configurations are correct and appropriate for your environment before each execution**
 - Validating storage account naming conventions, SKU selections, and file share quotas against your organisational standards
 - Applying appropriate security hardening, access controls, network restrictions, and compliance policies to all storage accounts in both source and destination regions
 - Ensuring data residency, sovereignty, and regulatory requirements are met for the target region before executing any data copy
