@@ -5,9 +5,9 @@
 .DESCRIPTION
     Reads a CSV of source storage account ARM Resource IDs with destination account names
     and resource groups. Looks up both accounts, validates compatibility with Azure Storage
-    Mover (blob-compatible types only, no HNS/ADLS Gen2), discovers all blob containers on
-    the source, ensures matching containers exist on the destination, then sets up all
-    Storage Mover resources (project, endpoints, RBAC, job definitions).
+    Mover, discovers all blob containers on the source, ensures matching containers exist
+    on the destination, then sets up all Storage Mover resources (project, endpoints,
+    RBAC, job definitions).
 
     The Storage Mover resource and its resource group are created automatically if they
     do not exist. Blob-to-blob Storage Mover jobs are cloud-managed — no on-premises
@@ -19,9 +19,11 @@
       - BlockBlobStorage (Premium block blob)
       - Storage (classic)
 
+    Skipped by default (opt-in with -IncludeHnsPreview):
+      - HNS-enabled / ADLS Gen2 (Preview, as of March 2026)
+
     NOT compatible (automatically skipped with warning):
       - FileStorage (no blob service)
-      - HNS-enabled / ADLS Gen2 (not supported by Storage Mover)
 
     Both source AND destination accounts must pass the compatibility check.
 
@@ -64,6 +66,11 @@
 .PARAMETER StartJobs
     Switch. If set, starts all created jobs after setup (capped at 10 concurrent).
 
+.PARAMETER IncludeHnsPreview
+    Switch. If set, includes HNS-enabled (ADLS Gen2) storage accounts instead of skipping them.
+    Azure-to-Azure blob migration for HNS accounts is in Preview as of March 2026.
+    This parameter will be removed when the feature reaches General Availability (GA).
+
 .PARAMETER DryRun
     Switch. Dry run — shows what would be created without making changes.
 
@@ -85,8 +92,8 @@
 
 .NOTES
     Author  : Sarmad Jari
-    Version : 2.0
-    Date    : 2026-03-10
+    Version : 2.1
+    Date    : 2026-03-12
     License : MIT License (https://opensource.org/licenses/MIT)
 
     DISCLAIMER
@@ -158,6 +165,7 @@ param (
     [Parameter(Mandatory=$false)][string]$DestSubscriptionId,
     [Parameter(Mandatory=$false)][ValidateSet("Additive","Mirror")][string]$CopyMode = "Additive",
     [switch]$StartJobs,
+    [switch]$IncludeHnsPreview,
     [switch]$DryRun
 )
 
@@ -436,11 +444,12 @@ try {
     }
 
     Write-Log "=================================================================="
-    Write-Log "  Storage Mover    : $StorageMoverName"
-    Write-Log "  Storage Mover RG : $StorageMoverRG"
-    Write-Log "  DestRegion       : $DestRegion"
-    Write-Log "  CopyMode         : $CopyMode"
-    Write-Log "  StartJobs        : $StartJobs"
+    Write-Log "  Storage Mover      : $StorageMoverName"
+    Write-Log "  Storage Mover RG   : $StorageMoverRG"
+    Write-Log "  DestRegion         : $DestRegion"
+    Write-Log "  CopyMode           : $CopyMode"
+    Write-Log "  StartJobs          : $StartJobs"
+    Write-Log "  IncludeHnsPreview  : $IncludeHnsPreview"
     Write-Log "=================================================================="
 
     # ── Ensure Storage Mover exists ──────────────────────────────
@@ -534,18 +543,21 @@ try {
                 continue
             }
             if ($SourceSA.isHnsEnabled -eq $true) {
-                Write-Log "  SKIP: Source '$($Source.AccountName)' has HNS enabled (ADLS Gen2)." "WARN" $Progress
-                $RowsSkipped++
-                $Results += [PSCustomObject]@{
-                    SourceAccount=$Source.AccountName; DestAccount=$DestAccountName; DestResourceGroup=$DestRGName
-                    DestSubscription=$DestSubId; ProjectName="N/A"; ContainerName="N/A"
-                    EndpointSource=""; EndpointTarget=""; JobName=""
-                    JobStatus="Skipped"; JobStarted="No"; CopyMode=$CopyMode
-                    Notes="HNS enabled (ADLS Gen2) - not supported by Storage Mover"
+                if (-not $IncludeHnsPreview) {
+                    Write-Log "  SKIP: Source '$($Source.AccountName)' has HNS enabled (ADLS Gen2). Use -IncludeHnsPreview to include HNS accounts (Preview as of March 2026)." "WARN" $Progress
+                    $RowsSkipped++
+                    $Results += [PSCustomObject]@{
+                        SourceAccount=$Source.AccountName; DestAccount=$DestAccountName; DestResourceGroup=$DestRGName
+                        DestSubscription=$DestSubId; ProjectName="N/A"; ContainerName="N/A"
+                        EndpointSource=""; EndpointTarget=""; JobName=""
+                        JobStatus="Skipped"; JobStarted="No"; CopyMode=$CopyMode
+                        Notes="HNS enabled (ADLS Gen2) - use -IncludeHnsPreview to include"
+                    }
+                    continue
                 }
-                continue
+                Write-Log "  NOTE: Source '$($Source.AccountName)' has HNS enabled (ADLS Gen2). Azure-to-Azure blob migration for HNS accounts is in Preview as of March 2026." "WARN" $Progress
             }
-            Write-Log "  Source validated: kind=$($SourceSA.kind)" "" $Progress
+            Write-Log "  Source validated: kind=$($SourceSA.kind), HNS=$(if ($SourceSA.isHnsEnabled -eq $true) { 'Enabled' } else { 'Disabled' })" "" $Progress
 
             # ── Step 3: Look up destination account ──
             Write-Log "  Looking up destination: $DestAccountName..." "" $Progress
@@ -569,18 +581,21 @@ try {
                 continue
             }
             if ($DestSA.isHnsEnabled -eq $true) {
-                Write-Log "  SKIP: Dest '$DestAccountName' has HNS enabled (ADLS Gen2)." "WARN" $Progress
-                $RowsSkipped++
-                $Results += [PSCustomObject]@{
-                    SourceAccount=$Source.AccountName; DestAccount=$DestAccountName; DestResourceGroup=$DestRGName
-                    DestSubscription=$DestSubId; ProjectName="N/A"; ContainerName="N/A"
-                    EndpointSource=""; EndpointTarget=""; JobName=""
-                    JobStatus="Skipped"; JobStarted="No"; CopyMode=$CopyMode
-                    Notes="Dest HNS enabled (ADLS Gen2) - not supported"
+                if (-not $IncludeHnsPreview) {
+                    Write-Log "  SKIP: Dest '$DestAccountName' has HNS enabled (ADLS Gen2). Use -IncludeHnsPreview to include HNS accounts (Preview as of March 2026)." "WARN" $Progress
+                    $RowsSkipped++
+                    $Results += [PSCustomObject]@{
+                        SourceAccount=$Source.AccountName; DestAccount=$DestAccountName; DestResourceGroup=$DestRGName
+                        DestSubscription=$DestSubId; ProjectName="N/A"; ContainerName="N/A"
+                        EndpointSource=""; EndpointTarget=""; JobName=""
+                        JobStatus="Skipped"; JobStarted="No"; CopyMode=$CopyMode
+                        Notes="Dest HNS enabled (ADLS Gen2) - use -IncludeHnsPreview to include"
+                    }
+                    continue
                 }
-                continue
+                Write-Log "  NOTE: Dest '$DestAccountName' has HNS enabled (ADLS Gen2). Azure-to-Azure blob migration for HNS accounts is in Preview as of March 2026." "WARN" $Progress
             }
-            Write-Log "  Dest validated: kind=$($DestSA.kind)" "" $Progress
+            Write-Log "  Dest validated: kind=$($DestSA.kind), HNS=$(if ($DestSA.isHnsEnabled -eq $true) { 'Enabled' } else { 'Disabled' })" "" $Progress
 
             # ── Step 4: List containers via ARM REST API (bypasses firewall) ──
             Write-Log "  Listing containers on source via ARM API..." "" $Progress

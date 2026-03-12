@@ -2,7 +2,7 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
-**Author:** Sarmad Jari | **Version:** 2.0 | **Date:** 2026-03-10
+**Author:** Sarmad Jari | **Version:** 2.1 | **Date:** 2026-03-12
 
 Sets up Azure Storage Mover blob-to-blob jobs from a CSV of storage account mappings. Discovers all blob containers on each source, validates compatibility, ensures matching containers exist on the destination, then creates all Storage Mover resources (project, endpoints, RBAC, job definitions). Optionally starts the jobs. The Storage Mover resource and its resource group are created automatically if they do not exist.
 
@@ -59,8 +59,8 @@ The script automatically skips incompatible accounts with a warning:
 | BlobStorage (legacy blob-only) | Yes | |
 | BlockBlobStorage (Premium) | Yes | |
 | Storage (classic) | Yes | |
+| HNS-enabled (ADLS Gen2) | Opt-in (Preview) | Skipped by default. Use `-IncludeHnsPreview` to include. Azure-to-Azure blob migration for HNS accounts is in Preview as of March 2026 |
 | FileStorage | No | Skipped — no blob service |
-| HNS-enabled (ADLS Gen2) | No | Skipped — not supported by Storage Mover |
 
 Both source AND destination must pass the compatibility check.
 
@@ -93,6 +93,7 @@ A sample CSV is provided: `resources-sample.csv`
 | `-DestSubscriptionId` | No | Destination subscription ID. Defaults to the source subscription |
 | `-CopyMode` | No | `Additive` (default) or `Mirror`. Both copy ALL existing objects on first run — Additive never deletes on target, Mirror syncs deletions |
 | `-StartJobs` | No | If set, starts jobs after setup (capped at 10 concurrent) |
+| `-IncludeHnsPreview` | No | If set, includes HNS-enabled (ADLS Gen2) accounts instead of skipping them. Preview as of March 2026. This parameter will be removed when the feature reaches GA |
 | `-DryRun` | No | Dry run — shows what would be created without making changes |
 
 ## Usage Examples
@@ -113,6 +114,12 @@ A sample CSV is provided: `resources-sample.csv`
 
 ```powershell
 ./Setup-StorageMoverBlobJobs.ps1 -CsvPath "./resources.csv" -DestRegion "switzerlandnorth" -StorageMoverName "sm-dr-001" -StorageMoverRG "rg-dr-storagemover" -CopyMode "Mirror" -StartJobs
+```
+
+### Include HNS-enabled accounts (Preview)
+
+```powershell
+./Setup-StorageMoverBlobJobs.ps1 -CsvPath "./resources.csv" -DestRegion "switzerlandnorth" -StorageMoverName "sm-dr-001" -StorageMoverRG "rg-dr-storagemover" -IncludeHnsPreview
 ```
 
 ### Cross-subscription — destination accounts in a different subscription
@@ -150,7 +157,7 @@ If any validation errors are found, the script reports **all errors at once** an
 | Step | Action |
 |---|---|
 | 1 | Parse source ARM Resource ID, determine destination subscription |
-| 2 | Validate source account (kind, HNS compatibility) — skip if incompatible |
+| 2 | Validate source account (kind, HNS) — skip if incompatible or HNS without `-IncludeHnsPreview` |
 | 3 | Look up destination account by name + RG — fail if not found, skip if incompatible |
 | 4 | List source containers via **ARM REST API** (bypasses source firewall) |
 | 5 | Filter out system containers (`$logs`, `$blobchangefeed`, `$web`, `$root`, etc.) |
@@ -260,6 +267,7 @@ The script exports a timestamped results CSV: `StorageMoverResults_YYYYMMDD_HHmm
 - **Max concurrent jobs** is capped at 10 to avoid overwhelming the Storage Mover service
 - **System containers** (`$logs`, `$blobchangefeed`, `$web`, `$root`, etc.) are automatically skipped
 - **No agent required** — blob-to-blob Storage Mover jobs are handled entirely by the Azure service
+- **HNS-enabled (ADLS Gen2) accounts** are skipped by default. Use `-IncludeHnsPreview` to include them. Azure-to-Azure blob migration for HNS accounts is in Preview as of March 2026. This parameter will be removed when the feature reaches GA
 - Cross-subscription scenarios are supported
 
 ## License

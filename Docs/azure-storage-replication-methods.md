@@ -83,6 +83,7 @@ Fully managed migration service for moving data from on-premises (SMB/NFS), AWS 
 - **Scope:** Per-job (source endpoint -> target endpoint)
 - **Direction:** On-premises/AWS/Azure -> Azure Blob containers or Azure File shares
 - **Agent:** Required for on-premises sources, agentless for cloud-to-cloud (AWS S3, Azure-to-Azure)
+- **HNS / ADLS Gen2:** Supported for Azure-to-Azure blob migration (Preview as of March 2026)
 - **Cost:** Service is free, standard storage, transaction, and egress charges apply
 
 ### 5. AzCopy
@@ -125,7 +126,7 @@ Snapshot-based and vaulted backup for Azure file shares. Provides point-in-time 
 | **GRS / RA-GRS** | ✅ Supported | ✅ Supported | ❌ Not Supported | ❌ Not Supported | ❌ Not Supported | ❌ Not Supported | ✅ Supported | ✅ Supported |
 | **GZRS / RA-GZRS** | ✅ Supported | ✅ Supported | ❌ Not Supported | ❌ Not Supported | ❌ Not Supported | ❌ Not Supported | ❌ Not Supported | ❌ Not Supported |
 | **Object Replication** | ✅ Recommended | ❌ Not Supported | ✅ Supported | ❌ Not Supported | ❌ Not Supported | ❌ Not Supported | ❌ Not Supported | ❌ Not Supported |
-| **Storage Mover (target)** | ✅ Supported | ✅ Recommended | ✅ Supported ² | ✅ Supported ² | ✅ Supported ³ | ❌ Not Supported | ❌ Not Supported | ❌ Not Supported |
+| **Storage Mover (target)** | ✅ Supported | ✅ Recommended ⁶ | ✅ Supported ² | ✅ Supported ² ⁶ | ✅ Supported ³ | ❌ Not Supported | ❌ Not Supported | ❌ Not Supported |
 | **AzCopy** | ✅ Supported | ✅ Supported | ✅ Supported | ✅ Supported | ✅ Supported | ✅ Supported | ✅ Supported | ✅ Supported |
 | **Data Factory** | ✅ Supported | ✅ Supported | ✅ Supported | ✅ Supported | ✅ Supported | ✅ Supported | ✅ Supported | ✅ Supported |
 | **Azure File Sync** | ✅ Supported ⁴ | ❌ Not Supported | ❌ Not Supported | ❌ Not Supported | ❌ Not Supported | ❌ Not Supported | ❌ Not Supported | ❌ Not Supported |
@@ -135,7 +136,8 @@ Snapshot-based and vaulted backup for Azure file shares. Provides point-in-time 
 > ² Storage Mover targets blob containers only for block blob accounts.  
 > ³ Storage Mover targets Azure File shares only for Premium File Shares accounts.  
 > ⁴ Azure File Sync and Azure Backup (Files) apply to SMB file shares within Standard GPv2 accounts only, not to blobs or other services in the same account.  
-> ⁵ Azure Backup supports snapshot-based backup for SSD premium file shares, vaulted backup is GA for HDD file shares.  
+> ⁵ Azure Backup supports snapshot-based backup for SSD premium file shares, vaulted backup is GA for HDD file shares.
+> ⁶ Azure-to-Azure blob migration for HNS-enabled accounts is in Preview as of March 2026.
 
 ---
 
