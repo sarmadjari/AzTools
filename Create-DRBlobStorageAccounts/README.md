@@ -44,12 +44,12 @@ The script supports creating DR copies of the following storage account types:
 | Storage Account Type | Account Creation | Object Replication |
 |---|---|---|
 | **StorageV2** (General Purpose v2) | Yes | Yes |
-| **BlobStorage** (legacy blob-only) | Yes | Yes |
+| **BlobStorage** (legacy blob-only) | Yes | No (not supported by Azure) |
 | **BlockBlobStorage** (Premium block blob) | Yes | Yes |
 | **FileStorage** (Premium file shares) | Yes | No (no blob service) |
 | **StorageV2 with HNS** (ADLS Gen2 / Data Lake) | Yes | No (not supported by Azure) |
 
-> **Note:** Object Replication is only supported on **StorageV2**, **BlobStorage**, and **BlockBlobStorage** accounts without Hierarchical Namespace (HNS). If `-ConfigureObjectReplication` is used with an incompatible account type (e.g., FileStorage, HNS-enabled), the script **automatically skips** the replication step for that account with a warning — the storage account and containers are still created successfully.
+> **Note:** Object Replication is only supported on **StorageV2** and **BlockBlobStorage** accounts without Hierarchical Namespace (HNS). If `-ConfigureObjectReplication` is used with an incompatible account type (e.g., BlobStorage, FileStorage, HNS-enabled), the script **automatically skips** the replication step for that account with a warning — the storage account and containers are still created successfully.
 
 ## Prerequisites
 
@@ -281,8 +281,8 @@ Replication monitoring is **enabled by default** on all policies created by the 
 
 ### Supported Account Types for Object Replication
 
-- **Supported:** StorageV2 (General Purpose v2), BlobStorage (legacy blob-only), BlockBlobStorage (Premium block blob)
-- **NOT supported:** Accounts with Hierarchical Namespace enabled (HNS / ADLS Gen2), FileStorage
+- **Supported:** StorageV2 (General Purpose v2), BlockBlobStorage (Premium block blob)
+- **NOT supported:** BlobStorage (legacy blob-only), Accounts with Hierarchical Namespace enabled (HNS / ADLS Gen2), FileStorage
 - **Auto-skip:** The script automatically detects incompatible account types and skips the Object Replication step with a warning. The storage account and containers are still created — only the replication configuration is skipped.
 
 ## Running in Azure Cloud Shell

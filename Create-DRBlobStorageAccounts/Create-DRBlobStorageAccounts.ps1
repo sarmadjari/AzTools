@@ -17,8 +17,8 @@
       - StorageV2 with HNS enabled (ADLS Gen2 / Data Lake)
 
     Object Replication compatibility (when using -ConfigureObjectReplication):
-      - Supported: StorageV2 (General Purpose v2), BlobStorage (legacy), BlockBlobStorage (Premium)
-      - NOT supported: Accounts with Hierarchical Namespace (HNS/ADLS Gen2), FileStorage
+      - Supported: StorageV2 (General Purpose v2), BlockBlobStorage (Premium)
+      - NOT supported: BlobStorage (legacy), Accounts with Hierarchical Namespace (HNS/ADLS Gen2), FileStorage
       - Incompatible account types are automatically SKIPPED (not failed) — the storage
         account and containers are still created, only the replication step is skipped
         with a warning logged.
@@ -817,12 +817,12 @@ try {
             }
 
             # 9. Configure Object Replication (if requested) — before locking down networking
-            # Object Replication is only supported on StorageV2, BlobStorage, and BlockBlobStorage without HNS.
-            # Incompatible account types (FileStorage, HNS-enabled) are automatically skipped.
+            # Object Replication is only supported on StorageV2 and BlockBlobStorage without HNS.
+            # Incompatible account types (BlobStorage, FileStorage, HNS-enabled) are automatically skipped.
             $ObjReplStatus = "N/A"
-            if ($ConfigureObjectReplication -and ($SourceKind -notin @("StorageV2", "BlobStorage", "BlockBlobStorage") -or $SourceHns -eq $true)) {
+            if ($ConfigureObjectReplication -and ($SourceKind -notin @("StorageV2", "BlockBlobStorage") -or $SourceHns -eq $true)) {
                 $SkipReason = if ($SourceHns -eq $true) { "HNS (ADLS Gen2) is enabled" } else { "account type '$SourceKind'" }
-                Write-Log "  Skipping Object Replication — not compatible: $SkipReason. Only StorageV2, BlobStorage, and BlockBlobStorage without HNS are supported." "WARN" $Progress
+                Write-Log "  Skipping Object Replication — not compatible: $SkipReason. Only StorageV2 and BlockBlobStorage without HNS are supported." "WARN" $Progress
                 $ObjReplStatus = "Skipped (incompatible: $SourceKind, HNS=$SourceHns)"
             } elseif ($ConfigureObjectReplication -and $ContainerCount -eq 0) {
                 Write-Log "  Skipping Object Replication — no user containers to replicate." "WARN" $Progress

@@ -2,9 +2,9 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
-**Author:** Sarmad Jari | **Version:** 1.0 | **Date:** 2026-03-09
+**Author:** Sarmad Jari | **Version:** 1.1 | **Date:** 2026-03-12
 
-Scans Azure subscriptions and inventories blob-compatible storage accounts. Determines the recommended replication tool based on Hierarchical Namespace (HNS) status, networking configuration, and AzCopy server-side copy readiness.
+Scans Azure subscriptions and inventories blob-compatible storage accounts. Determines the recommended replication tool based on account kind and Hierarchical Namespace (HNS) status, checks networking configuration, and assesses AzCopy server-side copy readiness.
 
 ---
 
@@ -45,17 +45,20 @@ By using this script, you accept full responsibility for:
 | 1 | Resolve target subscriptions (all accessible or specified list) |
 | 2 | Scan each subscription for storage accounts |
 | 3 | Filter to blob-compatible kinds (StorageV2, BlobStorage, BlockBlobStorage, Storage) |
-| 4 | Determine HNS status and recommended replication tool |
+| 4 | Determine account kind, HNS status, legacy flag, and recommended replication tool |
 | 5 | Check networking configuration (public access, firewall, trusted services bypass) |
 | 6 | Assess AzCopy server-side copy readiness |
 | 7 | Export results to a timestamped CSV |
 
 ## Replication Tool Recommendation
 
-| HNS Status | Recommended Tool |
-|---|---|
-| HNS Disabled (standard blob) | Object Replication |
-| HNS Enabled (ADLS Gen2) | Azure Storage Mover |
+| Account Kind | HNS Status | Recommended Tool |
+|---|---|---|
+| StorageV2, BlockBlobStorage | Disabled | Object Replication |
+| Any kind | Enabled (ADLS Gen2) | Azure Storage Mover |
+| BlobStorage, Storage (GPv1) | Disabled | Upgrade to GPv2 |
+
+> **Note:** BlobStorage and GPv1 (Storage) are legacy account types retiring **October 13, 2026**. These types do not support Object Replication. Upgrade to GPv2 before configuring replication.
 
 ## Parameters
 
@@ -92,8 +95,10 @@ Exports a CSV file: `BlobStorageInventory_YYYYMMDD_HHmmss.csv`
 | `Region` | Storage account location |
 | `StorageAccountName` | Account name |
 | `ResourceId` | Full ARM Resource ID |
+| `AccountKind` | Storage account kind (`StorageV2`, `BlobStorage`, `BlockBlobStorage`, `Storage`) |
 | `HierarchicalNamespace` | `Enabled` or `Disabled` |
-| `ReplicationTool` | Recommended tool (`Object Replication` or `Azure Storage Mover`) |
+| `LegacyAccount` | `Yes` for BlobStorage and Storage (GPv1) accounts, `No` otherwise |
+| `ReplicationTool` | Recommended tool (`Object Replication`, `Azure Storage Mover`, or `Upgrade to GPv2`) |
 | `PublicNetworkAccess` | Public access setting |
 | `FirewallDefaultAction` | `Allow` or `Deny` |
 | `TrustedServicesBypass` | `Yes` or `No` |

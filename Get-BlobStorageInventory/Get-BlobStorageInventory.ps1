@@ -4,9 +4,10 @@
 .DESCRIPTION
     Scans one, multiple, or all Azure subscriptions and lists storage accounts
     that support blob storage. Determines the recommended replication tool based
-    on Hierarchical Namespace (HNS) status:
-      - HNS Enabled  (ADLS Gen2)    → Azure Storage Mover
-      - HNS Disabled  (standard blob) → Object Replication
+    on account kind and Hierarchical Namespace (HNS) status:
+      - StorageV2/BlockBlobStorage, HNS Disabled  → Object Replication
+      - Any kind, HNS Enabled (ADLS Gen2)         → Azure Storage Mover
+      - BlobStorage/Storage (GPv1), HNS Disabled   → Upgrade to GPv2
 
     Outputs a CSV file that can be used as input for other automation tools.
 
@@ -32,7 +33,7 @@
 
 .NOTES
     Author  : Sarmad Jari
-    Version : 1.0
+    Version : 1.1
     Date    : 2026-03-09
     License : MIT License (https://opensource.org/licenses/MIT)
 
@@ -143,6 +144,10 @@ try {
     $TotalAccounts = 0
     $HnsEnabledCount = 0
     $HnsDisabledCount = 0
+    $ObjectReplicationCount = 0
+    $StorageMoverCount = 0
+    $LegacyAccountCount = 0
+    $UpgradeNeededCount = 0
 
     foreach ($Sub in $Subscriptions) {
         Write-Log "=================================================================="
@@ -171,9 +176,28 @@ try {
                 $TotalAccounts++
 
                 $HnsStatus = if ($Acct.isHnsEnabled -eq $true) { "Enabled" } else { "Disabled" }
-                $ReplicationTool = if ($Acct.isHnsEnabled -eq $true) { "Azure Storage Mover" } else { "Object Replication" }
+                $IsLegacy = if ($Acct.kind -in @("BlobStorage", "Storage")) { "Yes" } else { "No" }
+
+                # Replication tool recommendation based on BOTH account kind and HNS status:
+                #   StorageV2/BlockBlobStorage + HNS disabled  -> Object Replication
+                #   Any kind + HNS enabled                     -> Azure Storage Mover
+                #   BlobStorage/Storage (GPv1) + HNS disabled  -> Upgrade to GPv2
+                $ReplicationTool = if ($Acct.isHnsEnabled -eq $true) {
+                    "Azure Storage Mover"
+                } elseif ($Acct.kind -in @("StorageV2", "BlockBlobStorage")) {
+                    "Object Replication"
+                } else {
+                    "Upgrade to GPv2"
+                }
 
                 if ($HnsStatus -eq "Enabled") { $HnsEnabledCount++ } else { $HnsDisabledCount++ }
+                if ($IsLegacy -eq "Yes") { $LegacyAccountCount++ }
+
+                switch ($ReplicationTool) {
+                    "Object Replication"  { $ObjectReplicationCount++ }
+                    "Azure Storage Mover" { $StorageMoverCount++ }
+                    "Upgrade to GPv2"     { $UpgradeNeededCount++ }
+                }
 
                 # Determine public network access and firewall settings
                 $PublicAccess = if ($Acct.publicNetworkAccess) { $Acct.publicNetworkAccess } else { "Enabled" }
@@ -190,7 +214,7 @@ try {
                     "No"
                 }
 
-                Write-Log "  $($Acct.name) | $($Acct.location) | HNS: $HnsStatus | PublicAccess: $PublicAccess | TrustedServices: $TrustedServices | AzCopyReady: $AzCopyReady"
+                Write-Log "  $($Acct.name) | $($Acct.kind) | $($Acct.location) | HNS: $HnsStatus | Tool: $ReplicationTool | PublicAccess: $PublicAccess | TrustedServices: $TrustedServices | AzCopyReady: $AzCopyReady"
 
                 $Results += [PSCustomObject]@{
                     SubscriptionId        = $Sub.Id
@@ -198,7 +222,9 @@ try {
                     Region                = $Acct.location
                     StorageAccountName    = $Acct.name
                     ResourceId            = $Acct.id
+                    AccountKind           = $Acct.kind
                     HierarchicalNamespace = $HnsStatus
+                    LegacyAccount         = $IsLegacy
                     ReplicationTool       = $ReplicationTool
                     PublicNetworkAccess   = $PublicAccess
                     FirewallDefaultAction = $DefaultAction
@@ -225,10 +251,14 @@ try {
     # ── Summary ──────────────────────────────────────────────────
     Write-Log "=================================================================="
     Write-Log "SUMMARY"
-    Write-Log "  Total subscriptions scanned : $($Subscriptions.Count)"
-    Write-Log "  Total blob storage accounts : $TotalAccounts"
-    Write-Log "  HNS Enabled  (Storage Mover)      : $HnsEnabledCount"
-    Write-Log "  HNS Disabled (Object Replication)  : $HnsDisabledCount"
+    Write-Log "  Total subscriptions scanned        : $($Subscriptions.Count)"
+    Write-Log "  Total blob storage accounts        : $TotalAccounts"
+    Write-Log "  HNS Enabled                        : $HnsEnabledCount"
+    Write-Log "  HNS Disabled                       : $HnsDisabledCount"
+    Write-Log "  Object Replication compatible       : $ObjectReplicationCount"
+    Write-Log "  Azure Storage Mover (HNS)          : $StorageMoverCount"
+    Write-Log "  Legacy accounts (BlobStorage/GPv1) : $LegacyAccountCount"
+    Write-Log "  Upgrade needed (legacy, no OR)     : $UpgradeNeededCount"
     Write-Log "=================================================================="
 
 } catch {
