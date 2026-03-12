@@ -39,7 +39,7 @@ By using these scripts, you accept full responsibility for:
 
 ### [Get-BlobStorageInventory](./Get-BlobStorageInventory)
 
-Scans Azure subscriptions and inventories blob-compatible storage accounts. Determines the recommended replication tool based on Hierarchical Namespace (HNS) status, networking configuration, and AzCopy server-side copy readiness. Read-only — does not modify any Azure resources.
+Scans Azure subscriptions and inventories blob-compatible storage accounts. Determines the recommended replication tool based on Hierarchical Namespace (HNS) status, networking configuration, and AzCopy server-side copy readiness. Read-only, does not modify any Azure resources.
 
 ### [Create-DRFileShareAccounts](./Create-DRFileShareAccounts)
 
@@ -51,15 +51,15 @@ Creates destination storage accounts for Azure Blob Storage disaster recovery fr
 
 ### [Setup-StorageMoverBlobJobs](./Setup-StorageMoverBlobJobs)
 
-Sets up Azure Storage Mover blob-to-blob jobs from a CSV of storage account mappings. Discovers all blob containers on each source, validates compatibility, ensures matching containers exist on the destination, then creates all Storage Mover resources (project, endpoints, RBAC, job definitions). Cloud-managed — no on-premises agent required.
+Sets up Azure Storage Mover blob-to-blob jobs from a CSV of storage account mappings. Discovers all blob containers on each source, validates compatibility, ensures matching containers exist on the destination, then creates all Storage Mover resources (project, endpoints, RBAC, job definitions). Cloud-managed, no on-premises agent required.
 
 ### [Sync-DRFileShares](./Sync-DRFileShares)
 
 Contains two scripts:
 
-- **Sync-DRFileShares.ps1** — Syncs Azure File Shares from source to destination using `azcopy sync`. Compares source vs destination and transfers only changed files. Supports Additive (default, no deletes) and Mirror (syncs deletions) modes. Dual-mode — works both interactively and as an Azure Automation Runbook.
+- **Sync-DRFileShares.ps1** — Syncs Azure File Shares from source to destination using `azcopy sync`. Compares source vs destination and transfers only changed files. Supports Additive (default, no deletes) and Mirror (syncs deletions) modes. Dual-mode, works both interactively and as an Azure Automation Runbook.
 
-- **Setup-SyncAutomation.ps1** — Deploys an Azure Automation Account, Hybrid Worker VM, recurring schedule, and all supporting resources to run `Sync-DRFileShares.ps1` on a configurable interval. One-command setup — auto-creates a VM if none is provided.
+- **Setup-SyncAutomation.ps1** — Deploys an Azure Automation Account, Hybrid Worker VM, recurring schedule, and all supporting resources to run `Sync-DRFileShares.ps1` on a configurable interval. One-command setup, auto-creates a VM if none is provided.
 
 ## Typical Workflow
 
