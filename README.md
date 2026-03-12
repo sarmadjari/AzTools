@@ -43,7 +43,7 @@ Scans Azure subscriptions and inventories blob-compatible storage accounts. Dete
 
 ### [Create-DRFileShareAccounts](./Create-DRFileShareAccounts)
 
-Creates destination storage accounts for Azure File Share disaster recovery from a CSV mapping. Replicates account configuration (SKU, kind, tags, access tier), creates matching file shares with matching quotas, and optionally copies data via AzCopy server-side copy.
+Creates destination storage accounts for Azure File Share disaster recovery from a CSV mapping. Replicates account configuration (SKU, kind, tags, access tier), creates matching file shares with matching quotas, and copies data via AzCopy server-side copy.
 
 ### [Create-DRBlobStorageAccounts](./Create-DRBlobStorageAccounts)
 
@@ -63,11 +63,19 @@ Contains two scripts:
 
 ## Typical Workflow
 
+### Blob Storage DR
+
 ```
-1. Inventory           →  Get-BlobStorageInventory.ps1 (scan & assess)
-2. Create DR accounts  →  Create-DRFileShareAccounts.ps1 / Create-DRBlobStorageAccounts.ps1
-3. Blob replication    →  Setup-StorageMoverBlobJobs.ps1 (Storage Mover) or Object Replication
-4. File share sync     →  Sync-DRFileShares.ps1 (manual or automated via Setup-SyncAutomation.ps1)
+1. Inventory             →  Get-BlobStorageInventory.ps1 (scan & assess replication method)
+2. Create DR accounts    →  Create-DRBlobStorageAccounts.ps1 (with -ConfigureObjectReplication for ongoing replication)
+3. Storage Mover (HNS)   →  Setup-StorageMoverBlobJobs.ps1 (for ADLS Gen2 / HNS-enabled accounts)
+```
+
+### File Share DR
+
+```
+1. Create DR accounts    →  Create-DRFileShareAccounts.ps1 (creates accounts, shares, and copies data)
+2. Ongoing sync          →  Sync-DRFileShares.ps1 (manual or automated via Setup-SyncAutomation.ps1)
 ```
 
 ## Prerequisites
