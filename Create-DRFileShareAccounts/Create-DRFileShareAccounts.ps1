@@ -63,8 +63,8 @@
 
 .NOTES
     Author  : Sarmad Jari
-    Version : 1.0
-    Date    : 2026-03-10
+    Version : 1.1
+    Date    : 2026-03-13
     License : MIT License (https://opensource.org/licenses/MIT)
 
     DISCLAIMER
@@ -408,6 +408,67 @@ function Format-Duration {
     }
 }
 
+function Format-FileSize {
+    param([long]$Bytes)
+    if ($Bytes -ge 1TB) { return "{0:N1} TB" -f ($Bytes / 1TB) }
+    if ($Bytes -ge 1GB) { return "{0:N1} GB" -f ($Bytes / 1GB) }
+    if ($Bytes -ge 1MB) { return "{0:N1} MB" -f ($Bytes / 1MB) }
+    if ($Bytes -ge 1KB) { return "{0:N1} KB" -f ($Bytes / 1KB) }
+    return "$Bytes bytes"
+}
+
+function Parse-AzCopyOutput {
+    <#
+    .SYNOPSIS
+        Parses AzCopy stdout/stderr to extract transfer statistics.
+        Returns a PSCustomObject with transfer counts and bytes.
+    #>
+    param([string[]]$Output)
+
+    $Stats = [PSCustomObject]@{
+        FinalJobStatus     = "Unknown"
+        TransfersCompleted = 0
+        TransfersFailed    = 0
+        TransfersSkipped   = 0
+        TotalTransfers     = 0
+        BytesTransferred   = 0
+    }
+
+    if (-not $Output) { return $Stats }
+
+    foreach ($Line in $Output) {
+        if ($Line -match "Final Job Status:\s*(.+)") {
+            $Stats.FinalJobStatus = $Matches[1].Trim()
+        }
+        elseif ($Line -match "Number of File Transfers:\s*(\d+)") {
+            $Stats.TransfersCompleted = [int]$Matches[1]
+        }
+        elseif ($Line -match "Number of Transfers Completed:\s*(\d+)") {
+            $Stats.TransfersCompleted = [int]$Matches[1]
+        }
+        elseif ($Line -match "Number of File Transfers Failed:\s*(\d+)") {
+            $Stats.TransfersFailed = [int]$Matches[1]
+        }
+        elseif ($Line -match "Number of Transfers Failed:\s*(\d+)") {
+            $Stats.TransfersFailed = [int]$Matches[1]
+        }
+        elseif ($Line -match "Number of File Transfers Skipped:\s*(\d+)") {
+            $Stats.TransfersSkipped = [int]$Matches[1]
+        }
+        elseif ($Line -match "Number of Transfers Skipped:\s*(\d+)") {
+            $Stats.TransfersSkipped = [int]$Matches[1]
+        }
+        elseif ($Line -match "Total Number of Transfers:\s*(\d+)") {
+            $Stats.TotalTransfers = [int]$Matches[1]
+        }
+        elseif ($Line -match "TotalBytesTransferred:\s*(\d+)") {
+            $Stats.BytesTransferred = [long]$Matches[1]
+        }
+    }
+
+    return $Stats
+}
+
 try {
     # ── Validate inputs ──────────────────────────────────────────
     if (-Not (Test-Path $CsvPath)) {
@@ -542,6 +603,7 @@ try {
     $AccountsCopySkipped = 0
     $TotalSharesCreated = 0
     $TotalSharesCopied = 0
+    $TotalSharesCopyFailed = 0
 
     # ── Track resource groups already ensured ─────────────────────
     $EnsuredResourceGroups = @{}
@@ -783,18 +845,23 @@ try {
             az account set --subscription $Source.SubscriptionId | Out-Null
 
             $ArmSharesUrl = "https://management.azure.com/subscriptions/$($Source.SubscriptionId)/resourceGroups/$($Source.ResourceGroup)/providers/Microsoft.Storage/storageAccounts/$($Source.AccountName)/fileServices/default/shares?api-version=2023-05-01"
-            $ArmSharesJson = az rest --method GET --url $ArmSharesUrl -o json 2>$null
+            $ShareListResult = Invoke-AzCommand -Arguments @("rest", "--method", "GET", "--url", $ArmSharesUrl, "-o", "json") -MaxRetries 2
+            if (-not $ShareListResult.Success) {
+                throw "Failed to list file shares on source '$($Source.AccountName)': $($ShareListResult.ErrorDetail)"
+            }
 
             $SourceShares = @()
-            if ($ArmSharesJson) {
-                $ArmSharesObj = $ArmSharesJson | ConvertFrom-Json
-                $SourceShares = @($ArmSharesObj.value | ForEach-Object {
-                    @{
-                        Name       = $_.name
-                        Quota      = $_.properties.shareQuota
-                        AccessTier = $_.properties.accessTier
-                    }
-                })
+            if ($ShareListResult.StdOut) {
+                $ArmSharesObj = $ShareListResult.StdOut | ConvertFrom-Json
+                if ($ArmSharesObj.value) {
+                    $SourceShares = @($ArmSharesObj.value | ForEach-Object {
+                        @{
+                            Name       = $_.name
+                            Quota      = $_.properties.shareQuota
+                            AccessTier = $_.properties.accessTier
+                        }
+                    })
+                }
             }
 
             $ShareCount = $SourceShares.Count
@@ -802,6 +869,7 @@ try {
 
             # 8. Create matching shares on destination via ARM (az storage share-rm create)
             $SharesCreatedThisRow = 0
+            $SharesFailedThisRow = 0
             if ($ShareCount -gt 0) {
                 az account set --subscription $DestSubId | Out-Null
 
@@ -827,24 +895,29 @@ try {
                             $ShareCreateArgs += @("--access-tier", $Share.AccessTier)
                         }
 
-                        Invoke-AzCommand -Arguments $ShareCreateArgs -IgnoreExitCode | Out-Null
-                        Write-Log "    Share created/verified: $ShareName (quota=${ShareQuota}GB)" "" $Progress
-                        $SharesCreatedThisRow++
-                        $TotalSharesCreated++
+                        $ShareCreateResult = Invoke-AzCommand -Arguments $ShareCreateArgs -IgnoreExitCode
+                        if ($ShareCreateResult.ExitCode -eq 0) {
+                            Write-Log "    Share created/verified: $ShareName (quota=${ShareQuota}GB)" "SUCCESS" $Progress
+                            $SharesCreatedThisRow++
+                            $TotalSharesCreated++
+                        } else {
+                            $ShareError = Get-AzErrorDetail -StderrOutput $ShareCreateResult.StdErr -StdoutOutput $ShareCreateResult.StdOut
+                            Write-Log "    Failed to create share '$ShareName': $ShareError" "WARN" $Progress
+                            $SharesFailedThisRow++
+                        }
                     }
                 }
             }
 
             # 9. AzCopy server-side (S2S) copy — data transfer
             $SharesCopiedThisRow = 0
+            $SharesCopyFailedThisRow = 0
             $CopySkipReason = $null
 
             if (-not $DryRun -and $ShareCount -gt 0) {
-                Write-Log "  Generating SAS tokens for AzCopy S2S copy..." "" $Progress
+                Write-Log "  Retrieving account keys for AzCopy S2S copy..." "" $Progress
 
-                $Expiry = (Get-Date).AddHours(4).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
-
-                # Source SAS (read + list) — gracefully skip data copy if keys are inaccessible
+                # Source key — gracefully skip data copy if keys are inaccessible
                 az account set --subscription $Source.SubscriptionId | Out-Null
                 if (-not $SourceAllowSharedKey) {
                     $CopySkipReason = "Source account '$($Source.AccountName)' has shared key access disabled (allowSharedKeyAccess=false). Enable shared key access to allow data copy."
@@ -862,10 +935,7 @@ try {
                 }
 
                 if (-not $CopySkipReason) {
-                    $SourceSasRaw = az storage account generate-sas --account-name $Source.AccountName --account-key $SourceKey --services f --resource-types sco --permissions rl --expiry $Expiry -o tsv
-                    $SourceSas = (($SourceSasRaw | Out-String) -replace "[\r\n\s]", "").TrimStart('?')
-
-                    # Destination SAS (all permissions)
+                    # Destination key
                     az account set --subscription $DestSubId | Out-Null
                     $DestKey = (az storage account keys list -g $DestRGName -n $DestAccountName --query "[0].value" -o tsv)
                     if ([string]::IsNullOrWhiteSpace($DestKey)) {
@@ -876,9 +946,6 @@ try {
                 }
 
                 if (-not $CopySkipReason) {
-                    $DestSasRaw = az storage account generate-sas --account-name $DestAccountName --account-key $DestKey --services f --resource-types sco --permissions acdlrwup --expiry $Expiry -o tsv
-                    $DestSas = (($DestSasRaw | Out-String) -replace "[\r\n\s]", "").TrimStart('?')
-
                     # Temporarily open source firewall if needed for AzCopy S2S copy
                     if ($SourceDefaultAction -eq "Deny" -or $SourcePublicAccess -eq "Disabled") {
                         az account set --subscription $Source.SubscriptionId | Out-Null
@@ -888,10 +955,48 @@ try {
                     # Clear env var to prevent SAS cross-contamination
                     Remove-Item env:AZURE_STORAGE_SAS_TOKEN -ErrorAction SilentlyContinue
 
+                    # Verify newly created shares are visible on data plane before copying
+                    if ($SharesCreatedThisRow -gt 0) {
+                        Write-Log "  Waiting for newly created share(s) to propagate to data plane..." "" $Progress
+                        $MaxRetries = 8
+                        $RetryDelaySec = 15
+                        foreach ($Share in $SourceShares) {
+                            $CheckResult = az storage share exists --name $Share.Name --account-name $DestAccountName --account-key $DestKey --query exists -o tsv 2>$null
+                            if ($CheckResult -notmatch "(?i)true") {
+                                # Share not yet visible — poll with retries
+                                $ShareReady = $false
+                                for ($Retry = 1; $Retry -le $MaxRetries; $Retry++) {
+                                    $CheckResult = az storage share exists --name $Share.Name --account-name $DestAccountName --account-key $DestKey --query exists -o tsv 2>$null
+                                    if ($CheckResult -match "(?i)true") {
+                                        $ShareReady = $true
+                                        break
+                                    }
+                                    if ($Retry -lt $MaxRetries) {
+                                        Write-Log "    Share '$($Share.Name)' not yet visible (attempt $Retry/$MaxRetries). Retrying in ${RetryDelaySec}s..." "" $Progress
+                                        Start-Sleep -Seconds $RetryDelaySec
+                                    }
+                                }
+                                if ($ShareReady) {
+                                    Write-Log "    Share '$($Share.Name)' confirmed available." "" $Progress
+                                } else {
+                                    Write-Log "    Share '$($Share.Name)' not visible after $($MaxRetries * $RetryDelaySec)s. AzCopy may fail for this share." "WARN" $Progress
+                                }
+                            }
+                        }
+                    }
+
                     # AzCopy S2S copy each share
                     try {
                         foreach ($Share in $SourceShares) {
                             $ShareName = $Share.Name
+
+                            # Generate fresh SAS tokens per share (8h expiry) to avoid token expiry on large/long-running copies
+                            $Expiry = (Get-Date).AddHours(8).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
+                            $SourceSasRaw = az storage account generate-sas --account-name $Source.AccountName --account-key $SourceKey --services f --resource-types sco --permissions rl --expiry $Expiry -o tsv
+                            $SourceSas = (($SourceSasRaw | Out-String) -replace "[\r\n\s]", "").TrimStart('?')
+                            $DestSasRaw = az storage account generate-sas --account-name $DestAccountName --account-key $DestKey --services f --resource-types sco --permissions acdlrwup --expiry $Expiry -o tsv
+                            $DestSas = (($DestSasRaw | Out-String) -replace "[\r\n\s]", "").TrimStart('?')
+
                             $SourceUrl = "https://{0}.file.core.windows.net/{1}?{2}" -f $Source.AccountName, $ShareName, $SourceSas
                             $DestUrl = "https://{0}.file.core.windows.net/{1}?{2}" -f $DestAccountName, $ShareName, $DestSas
 
@@ -906,16 +1011,35 @@ try {
                                 "--s2s-preserve-access-tier=true",
                                 "--preserve-smb-permissions=true",
                                 "--preserve-smb-info=true",
-                                "--recursive"
+                                "--recursive",
+                                "--log-level=ERROR"
                             )
-                            & azcopy $azCopyArgs
 
-                            if ($LASTEXITCODE -eq 0) {
-                                Write-Log "    Share copied: $ShareName" "SUCCESS" $Progress
+                            # Capture output for parsing and logging
+                            $azOutput = & azcopy $azCopyArgs 2>&1 | ForEach-Object { $_.ToString() }
+                            $azExitCode = $LASTEXITCODE
+
+                            # Stream captured output to log
+                            foreach ($azLine in $azOutput) {
+                                Write-Log "    [azcopy] $azLine" "" $Progress
+                            }
+
+                            # Parse transfer stats from AzCopy output
+                            $azStats = Parse-AzCopyOutput $azOutput
+
+                            if ($azExitCode -eq 0) {
+                                Write-Log "    Share copied: $ShareName ($($azStats.TransfersCompleted) files, $(Format-FileSize $azStats.BytesTransferred))" "SUCCESS" $Progress
                                 $SharesCopiedThisRow++
                                 $TotalSharesCopied++
+                            } elseif ($azExitCode -eq 1) {
+                                # Exit code 1 = partial success (some files transferred, some failed)
+                                Write-Log "    Share partially copied: $ShareName ($($azStats.TransfersCompleted) transferred, $($azStats.TransfersFailed) failed, $($azStats.TransfersSkipped) skipped)" "WARN" $Progress
+                                $SharesCopyFailedThisRow++
+                                $TotalSharesCopyFailed++
                             } else {
-                                Write-Log "    AzCopy failed for share '$ShareName' (exit code: $LASTEXITCODE). Check: firewall timing, private endpoints blocking public copy, or share-level permissions." "WARN" $Progress
+                                Write-Log "    AzCopy failed for share '$ShareName' (exit code: $azExitCode). Check: firewall timing, private endpoints blocking public copy, or share-level permissions." "WARN" $Progress
+                                $SharesCopyFailedThisRow++
+                                $TotalSharesCopyFailed++
                             }
                         }
                     } finally {
@@ -940,7 +1064,7 @@ try {
                 }
 
             } elseif ($DryRun -and $ShareCount -gt 0) {
-                Write-Log "  [DRYRUN] Would generate SAS tokens and copy $ShareCount share(s) via AzCopy (server-side)" "DRYRUN" $Progress
+                Write-Log "  [DRYRUN] Would generate per-share SAS tokens (8h expiry) and copy $ShareCount share(s) via AzCopy (server-side)" "DRYRUN" $Progress
                 if ($SourceDefaultAction -eq "Deny" -or $SourcePublicAccess -eq "Disabled") {
                     Write-Log "  [DRYRUN] Would temporarily open source firewall for AzCopy S2S copy" "DRYRUN" $Progress
                 }
@@ -989,6 +1113,13 @@ try {
                 $AccountsCopySkipped++
             }
 
+            if ($SharesFailedThisRow -gt 0) {
+                $RowNotes = @($RowNotes, "$SharesFailedThisRow share(s) failed to create") | Where-Object { $_ } | Join-String -Separator "; "
+            }
+            if ($SharesCopyFailedThisRow -gt 0) {
+                $RowNotes = @($RowNotes, "$SharesCopyFailedThisRow share(s) failed or partially failed to copy") | Where-Object { $_ } | Join-String -Separator "; "
+            }
+
             $Results += [PSCustomObject]@{
                 SourceAccount      = $Source.AccountName
                 DestAccount        = $DestAccountName
@@ -997,12 +1128,14 @@ try {
                 DestSubscription   = $DestSubId
                 AccountStatus      = $AccountStatus
                 SharesCreated      = $SharesCreatedThisRow
+                SharesFailed       = $SharesFailedThisRow
                 SharesCopied       = $SharesCopiedThisRow
+                SharesCopyFailed   = $SharesCopyFailedThisRow
                 NetworkingConfig   = $NetworkingConfig
                 Notes              = $RowNotes
             }
 
-            $ResultLevel = if ($CopySkipReason) { "WARN" } else { "SUCCESS" }
+            $ResultLevel = if ($CopySkipReason -or $SharesFailedThisRow -gt 0 -or $SharesCopyFailedThisRow -gt 0) { "WARN" } else { "SUCCESS" }
             Write-Log "  Done: $($Source.AccountName) -> $DestAccountName ($RowDuration)" $ResultLevel $Progress
 
         } catch {
@@ -1038,7 +1171,9 @@ try {
                 DestSubscription   = if ($DestSubId) { $DestSubId } else { "N/A" }
                 AccountStatus      = "Failed"
                 SharesCreated      = 0
+                SharesFailed       = 0
                 SharesCopied       = 0
+                SharesCopyFailed   = 0
                 NetworkingConfig   = ""
                 Notes              = $ErrorMessage
             }
@@ -1071,12 +1206,15 @@ try {
     Write-Log "  Accounts failed           : $AccountsFailed"  $(if ($AccountsFailed -gt 0) { "ERROR" } else { "INFO" })
     Write-Log "  Total shares created      : $TotalSharesCreated"
     Write-Log "  Total shares copied (S2S) : $TotalSharesCopied"
+    if ($TotalSharesCopyFailed -gt 0) {
+        Write-Log "  Total shares copy failed  : $TotalSharesCopyFailed" "WARN"
+    }
     Write-Log "  Total elapsed time        : $TotalDuration"
     Write-Log "  Results CSV               : $ResultsPath"
     Write-Log "==================================================================" "SUCCESS"
 
-    # ── Show details for failed accounts ──────────────────────────
-    $FailedResults = $Results | Where-Object { $_.AccountStatus -eq "Failed" }
+    # ── Show details for failed/issue accounts ─────────────────────
+    $FailedResults = @($Results | Where-Object { $_.AccountStatus -eq "Failed" })
     if ($FailedResults.Count -gt 0) {
         Write-Log ""
         Write-Log "==================================================================" "ERROR"
@@ -1090,6 +1228,24 @@ try {
             Write-Log "  --" "ERROR"
         }
         Write-Log "==================================================================" "ERROR"
+    }
+
+    # ── Show details for accounts with share/copy issues ───────────
+    $IssueResults = @($Results | Where-Object {
+        $_.AccountStatus -ne "Failed" -and ($_.Notes -and $_.Notes -ne "")
+    })
+    if ($IssueResults.Count -gt 0) {
+        Write-Log ""
+        Write-Log "  ISSUE DETAIL:" "WARN"
+        Write-Log "  ----------------------------------------------------------" "WARN"
+        foreach ($Issue in $IssueResults) {
+            Write-Log "  $($Issue.SourceAccount) -> $($Issue.DestAccount): $($Issue.AccountStatus)" "WARN"
+            Write-Log "    $($Issue.Notes)" "WARN"
+            if ($Issue.SharesCopied -gt 0 -or $Issue.SharesCopyFailed -gt 0) {
+                Write-Log "    Shares copied: $($Issue.SharesCopied), copy failed: $($Issue.SharesCopyFailed)" "WARN"
+            }
+        }
+        Write-Log "  ----------------------------------------------------------" "WARN"
     }
 
 } catch {

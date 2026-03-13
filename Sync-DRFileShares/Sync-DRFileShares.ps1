@@ -110,8 +110,8 @@
 
 .NOTES
     Author  : Sarmad Jari
-    Version : 2.1
-    Date    : 2026-03-12
+    Version : 2.2
+    Date    : 2026-03-13
     License : MIT License (https://opensource.org/licenses/MIT)
 
     DISCLAIMER
@@ -385,13 +385,33 @@ function Restore-StorageFirewall {
 
 function Format-Duration {
     param([TimeSpan]$Duration)
-    if ($Duration.TotalHours -ge 1) {
-        return "{0:N0}h {1:N0}m {2:N0}s" -f $Duration.Hours, $Duration.Minutes, $Duration.Seconds
-    } elseif ($Duration.TotalMinutes -ge 1) {
-        return "{0:N0}m {1:N0}s" -f [math]::Floor($Duration.TotalMinutes), $Duration.Seconds
-    } else {
-        return "{0:N0}s" -f [math]::Floor($Duration.TotalSeconds)
+    $Parts = @()
+    $TotalHours = [math]::Floor($Duration.TotalHours)
+    if ($TotalHours -ge 1) {
+        $Parts += if ($TotalHours -eq 1) { "1 hour" } else { "$TotalHours hours" }
     }
+    if ($Duration.Minutes -ge 1) {
+        $Parts += if ($Duration.Minutes -eq 1) { "1 minute" } else { "$($Duration.Minutes) minutes" }
+    }
+    if ($Parts.Count -eq 0 -or ($TotalHours -eq 0 -and $Duration.Seconds -gt 0)) {
+        $Secs = [math]::Floor($Duration.Seconds)
+        if ($Secs -gt 0 -or $Parts.Count -eq 0) {
+            $Parts += if ($Secs -eq 1) { "1 second" } else { "$Secs seconds" }
+        }
+    }
+    if ($Parts.Count -ge 2) {
+        return ($Parts[0..($Parts.Count-2)] -join ", ") + " and " + $Parts[-1]
+    }
+    return $Parts[0]
+}
+
+function Format-FileSize {
+    param([long]$Bytes)
+    if ($Bytes -ge 1TB) { return "{0:N1} TB" -f ($Bytes / 1TB) }
+    if ($Bytes -ge 1GB) { return "{0:N1} GB" -f ($Bytes / 1GB) }
+    if ($Bytes -ge 1MB) { return "{0:N1} MB" -f ($Bytes / 1MB) }
+    if ($Bytes -ge 1KB) { return "{0:N1} KB" -f ($Bytes / 1KB) }
+    return "$Bytes bytes"
 }
 
 function Parse-AzCopyOutput {
@@ -645,6 +665,10 @@ try {
     $TotalSharesSynced = 0
     $TotalSharesPartial = 0
     $TotalSharesFailed = 0
+    $TotalFilesTransferred = 0
+    $TotalFilesFailed = 0
+    $TotalFilesSkipped = 0
+    [long]$TotalBytesTransferred = 0
     $RowsSkipped = 0
     $RowsFailed = 0
 
@@ -665,6 +689,10 @@ try {
         $SharesSyncedThisRow = 0
         $SharesPartialThisRow = 0
         $SharesFailedThisRow = 0
+        $FilesTransferredThisRow = 0
+        $FilesFailedThisRow = 0
+        $FilesSkippedThisRow = 0
+        [long]$BytesTransferredThisRow = 0
 
         try {
             # ── Step 1: Parse source ARM ID and determine subscription ──
@@ -750,6 +778,7 @@ try {
                 }
             }
 
+            $NewlyCreatedShareNames = @()
             $MissingShares = @($SourceShareDetails | Where-Object { $_.Name -notin $DestShares })
             if ($MissingShares.Count -gt 0) {
                 Write-Log "  $($MissingShares.Count) share(s) missing on destination. Auto-creating via ARM API..." "" $Progress
@@ -772,6 +801,7 @@ try {
                     } else {
                         az @ShareCreateArgs 2>$null | Out-Null
                         Write-Log "    Share created: $($MissingShare.Name) (quota=$($MissingShare.Quota)GB)" "SUCCESS" $Progress
+                        $NewlyCreatedShareNames += $MissingShare.Name
                     }
                     $SharesCreatedThisRow++
                     $TotalSharesCreated++
@@ -780,7 +810,7 @@ try {
 
             # ── DryRun path ──
             if ($DryRun) {
-                Write-Log "  [DRYRUN] Would generate SAS tokens (4h expiry)" "DRYRUN" $Progress
+                Write-Log "  [DRYRUN] Would generate per-share SAS tokens (8h expiry each)" "DRYRUN" $Progress
                 if ($SourceDefaultAction -eq "Deny" -or $SourcePublicAccess -eq "Disabled") {
                     Write-Log "  [DRYRUN] Would temporarily open source firewall (defaultAction=$SourceDefaultAction, publicAccess=$SourcePublicAccess)" "DRYRUN" $Progress
                 }
@@ -811,11 +841,10 @@ try {
                 continue
             }
 
-            # ── Step 5: Generate SAS tokens ──
-            Write-Log "  Generating SAS tokens (4h expiry)..." "" $Progress
-            $Expiry = (Get-Date).AddHours(4).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
+            # ── Step 5: Retrieve account keys (SAS tokens generated per-share in Step 8) ──
+            Write-Log "  Retrieving account keys..." "" $Progress
 
-            # Source SAS (read + list)
+            # Source key
             az account set --subscription $Source.SubscriptionId | Out-Null
             if (-not $SourceAllowSharedKey) {
                 throw "Source account '$($Source.AccountName)' has shared key access disabled (allowSharedKeyAccess=false). Enable shared key access on the source account to allow SAS token generation for AzCopy."
@@ -824,10 +853,8 @@ try {
             if ([string]::IsNullOrWhiteSpace($SourceKey)) {
                 throw "Failed to retrieve key for source account '$($Source.AccountName)'. Verify your identity has the 'Storage Account Key Operator Service Role' or 'Contributor' role on the source resource group."
             }
-            $SourceSasRaw = az storage account generate-sas --account-name $Source.AccountName --account-key $SourceKey --services f --resource-types sco --permissions rl --expiry $Expiry -o tsv
-            $SourceSas = (($SourceSasRaw | Out-String) -replace "[\r\n\s]", "").TrimStart('?')
 
-            # Destination SAS (all permissions — azcopy sync needs read+write+delete for comparison and Mirror mode)
+            # Destination key
             az account set --subscription $DestSubId | Out-Null
             if (-not $DestAllowSharedKey) {
                 throw "Destination account '$DestAccountName' has shared key access disabled (allowSharedKeyAccess=false). Enable shared key access on the destination account to allow SAS token generation for AzCopy."
@@ -836,8 +863,6 @@ try {
             if ([string]::IsNullOrWhiteSpace($DestKey)) {
                 throw "Failed to retrieve key for destination account '$DestAccountName'. Verify your identity has the 'Storage Account Key Operator Service Role' or 'Contributor' role on the destination resource group."
             }
-            $DestSasRaw = az storage account generate-sas --account-name $DestAccountName --account-key $DestKey --services f --resource-types sco --permissions acdlrwup --expiry $Expiry -o tsv
-            $DestSas = (($DestSasRaw | Out-String) -replace "[\r\n\s]", "").TrimStart('?')
 
             # ── Step 6: Open source firewall if restrictive ──
             if ($SourceDefaultAction -eq "Deny" -or $SourcePublicAccess -eq "Disabled") {
@@ -854,9 +879,42 @@ try {
             # Clear env var to prevent SAS cross-contamination
             Remove-Item env:AZURE_STORAGE_SAS_TOKEN -ErrorAction SilentlyContinue
 
+            # ── Step 7b: Verify newly created shares are visible on data plane ──
+            if ($NewlyCreatedShareNames.Count -gt 0) {
+                Write-Log "  Waiting for $($NewlyCreatedShareNames.Count) newly created share(s) to propagate to data plane..." "" $Progress
+                $MaxRetries = 8
+                $RetryDelaySec = 15
+                foreach ($NewShareName in $NewlyCreatedShareNames) {
+                    $ShareReady = $false
+                    for ($Retry = 1; $Retry -le $MaxRetries; $Retry++) {
+                        $CheckResult = az storage share exists --name $NewShareName --account-name $DestAccountName --account-key $DestKey --query exists -o tsv 2>$null
+                        if ($CheckResult -match "(?i)true") {
+                            $ShareReady = $true
+                            break
+                        }
+                        if ($Retry -lt $MaxRetries) {
+                            Write-Log "    Share '$NewShareName' not yet visible (attempt $Retry/$MaxRetries). Retrying in ${RetryDelaySec}s..." "" $Progress
+                            Start-Sleep -Seconds $RetryDelaySec
+                        }
+                    }
+                    if ($ShareReady) {
+                        Write-Log "    Share '$NewShareName' confirmed available." "" $Progress
+                    } else {
+                        Write-Log "    Share '$NewShareName' not visible after $($MaxRetries * $RetryDelaySec)s. AzCopy may fail for this share." "WARN" $Progress
+                    }
+                }
+            }
+
             # ── Step 8: AzCopy sync each share ──
             try {
                 foreach ($ShareName in $SourceShares) {
+                    # Generate fresh SAS tokens per share (8h expiry) to avoid token expiry on large/long-running syncs
+                    $Expiry = (Get-Date).AddHours(8).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
+                    $SourceSasRaw = az storage account generate-sas --account-name $Source.AccountName --account-key $SourceKey --services f --resource-types sco --permissions rl --expiry $Expiry -o tsv
+                    $SourceSas = (($SourceSasRaw | Out-String) -replace "[\r\n\s]", "").TrimStart('?')
+                    $DestSasRaw = az storage account generate-sas --account-name $DestAccountName --account-key $DestKey --services f --resource-types sco --permissions acdlrwup --expiry $Expiry -o tsv
+                    $DestSas = (($DestSasRaw | Out-String) -replace "[\r\n\s]", "").TrimStart('?')
+
                     $SourceUrl = "https://{0}.file.core.windows.net/{1}?{2}" -f $Source.AccountName, $ShareName, $SourceSas
                     $DestUrl   = "https://{0}.file.core.windows.net/{1}?{2}" -f $DestAccountName, $ShareName, $DestSas
 
@@ -896,8 +954,14 @@ try {
                     # Parse transfer stats from AzCopy output
                     $azStats = Parse-AzCopyOutput $azOutput
 
+                    # Accumulate file-level stats for this row
+                    $FilesTransferredThisRow += $azStats.TransfersCompleted
+                    $FilesFailedThisRow += $azStats.TransfersFailed
+                    $FilesSkippedThisRow += $azStats.TransfersSkipped
+                    $BytesTransferredThisRow += $azStats.BytesTransferred
+
                     if ($azExitCode -eq 0) {
-                        Write-Log "    Share synced: $ShareName ($($azStats.TransfersCompleted) files transferred)" "SUCCESS" $Progress
+                        Write-Log "    Share synced: $ShareName ($($azStats.TransfersCompleted) files, $(Format-FileSize $azStats.BytesTransferred))" "SUCCESS" $Progress
                         $SharesSyncedThisRow++
                         $TotalSharesSynced++
                     } elseif ($azExitCode -eq 1) {
@@ -942,7 +1006,12 @@ try {
                 Remove-Item env:AZURE_STORAGE_SAS_TOKEN -ErrorAction SilentlyContinue
             }
 
-            # ── Step 11: Record results ──
+            # ── Step 11: Accumulate file-level totals and record results ──
+            $TotalFilesTransferred += $FilesTransferredThisRow
+            $TotalFilesFailed += $FilesFailedThisRow
+            $TotalFilesSkipped += $FilesSkippedThisRow
+            $TotalBytesTransferred += $BytesTransferredThisRow
+
             $RowStatus = if ($SharesFailedThisRow -eq 0 -and $SharesPartialThisRow -eq 0) { "Completed" }
                          elseif ($SharesSyncedThisRow -gt 0 -or $SharesPartialThisRow -gt 0) { "PartialSync" }
                          else { "Failed" }
