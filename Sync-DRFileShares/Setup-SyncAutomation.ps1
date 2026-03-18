@@ -1083,25 +1083,45 @@ try {
         $PrincipalsToAssign += @{ Id = $VMPrincipalId; Label = "VM MI" }
     }
 
+    $RBACAssigned = 0
+    $RBACSkipped = 0
+
     foreach ($Scope in $UniqueRGScopes.Keys) {
         $ScopeType = $UniqueRGScopes[$Scope]
         foreach ($Principal in $PrincipalsToAssign) {
             if ($DryRun) {
                 Write-Log "  [DRYRUN] Would assign '$RoleName' to $($Principal.Label) ($($Principal.Id)) at $ScopeType scope: $Scope" "DRYRUN"
             } else {
-                Write-Log "  Assigning '$RoleName' to $($Principal.Label) at $ScopeType scope: $Scope..."
-                $RBACResult = Invoke-AzCommand -Arguments @(
-                    "role", "assignment", "create",
-                    "--assignee-object-id", $Principal.Id,
-                    "--assignee-principal-type", "ServicePrincipal",
+                # Check if assignment already exists before creating
+                $ExistingCheck = Invoke-AzCommand -Arguments @(
+                    "role", "assignment", "list",
+                    "--assignee", $Principal.Id,
                     "--role", $RoleName,
                     "--scope", $Scope,
-                    "-o", "none"
+                    "--query", "length(@)",
+                    "-o", "tsv"
                 ) -IgnoreExitCode
-                # IgnoreExitCode: idempotent — assignment may already exist
-                Write-Log "  Assigned." "SUCCESS"
+
+                if ($ExistingCheck.StdOut -and [int]$ExistingCheck.StdOut.Trim() -gt 0) {
+                    $RBACSkipped++
+                } else {
+                    Write-Log "  Assigning '$RoleName' to $($Principal.Label) at $ScopeType scope: $Scope..."
+                    $RBACResult = Invoke-AzCommand -Arguments @(
+                        "role", "assignment", "create",
+                        "--assignee-object-id", $Principal.Id,
+                        "--assignee-principal-type", "ServicePrincipal",
+                        "--role", $RoleName,
+                        "--scope", $Scope,
+                        "-o", "none"
+                    ) -IgnoreExitCode
+                    $RBACAssigned++
+                }
             }
         }
+    }
+
+    if (-not $DryRun) {
+        Write-Log "  RBAC: $RBACAssigned new assignment(s), $RBACSkipped already existed (skipped)." "SUCCESS"
     }
 
     # ── Step 7: Create Runtime Environment (PowerShell 7.4) ──────
