@@ -137,6 +137,15 @@ Use `Setup-SyncAutomation.ps1` to deploy everything in one command:
     -Location "switzerlandnorth" `
     -CsvPath "./resources.csv" `
     -ScheduleIntervalHours 4
+
+# Auto-creates a VM with a custom name
+./Setup-SyncAutomation.ps1 `
+    -AutomationAccountName "aa-dr-sync" `
+    -ResourceGroupName "rg-automation" `
+    -Location "switzerlandnorth" `
+    -CsvPath "./resources.csv" `
+    -HybridWorkerVMName "vm-mycustomname" `
+    -ScheduleIntervalHours 4
 ```
 
 If you already have a VM, pass its Resource ID instead:
