@@ -53,6 +53,10 @@ Creates destination storage accounts for Azure Blob Storage disaster recovery fr
 
 Sets up Azure Storage Mover blob-to-blob jobs from a CSV of storage account mappings. Discovers all blob containers on each source, validates compatibility, ensures matching containers exist on the destination, then creates all Storage Mover resources (project, endpoints, RBAC, job definitions). Cloud-managed, no on-premises agent required.
 
+### [Rehydrate-ArchiveBlobs](./Rehydrate-ArchiveBlobs)
+
+Discovers and rehydrates all Archive-tier blobs in an Azure Storage Account. Designed for ADLS Gen2 (HNS-enabled) accounts where the Azure Portal does not expose the "Change Access Tier" option, but works on standard blob storage accounts too. Supports configurable target tier (Hot/Cool), rehydrate priority (Standard/High), single-container or account-wide scanning, and generates full log, CSV report, and summary files.
+
 ### [Sync-DRFileShares](./Sync-DRFileShares)
 
 Contains two scripts:
