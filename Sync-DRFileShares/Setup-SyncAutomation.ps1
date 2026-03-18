@@ -201,6 +201,9 @@ param (
 $ErrorActionPreference = "Stop"
 $ScriptStartTime = Get-Date
 
+# Prevent 'az automation' from hanging on invisible extension installation prompts
+$env:AZURE_EXTENSION_USE_DYNAMIC_INSTALL = "yes_without_prompt"
+
 # ── Shared Functions ─────────────────────────────────────────────
 
 function Write-Log {
