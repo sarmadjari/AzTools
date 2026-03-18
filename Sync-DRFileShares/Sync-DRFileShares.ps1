@@ -709,9 +709,18 @@ try {
             # ── Step 2: Validate source account exists ──
             Write-Log "  Validating source: $($Source.AccountName)..." "" $Progress
             az account set --subscription $Source.SubscriptionId | Out-Null
-            $SourceCheck = az storage account show --name $Source.AccountName --resource-group $Source.ResourceGroup --query "{name:name, defaultAction:networkRuleSet.defaultAction, publicNetworkAccess:publicNetworkAccess, allowSharedKeyAccess:allowSharedKeyAccess}" -o json 2>$null
+            $SourceStderr = $null
+            $SourceCheck = az storage account show --name $Source.AccountName --resource-group $Source.ResourceGroup --query "{name:name, defaultAction:networkRuleSet.defaultAction, publicNetworkAccess:publicNetworkAccess, allowSharedKeyAccess:allowSharedKeyAccess}" -o json 2>&1 | ForEach-Object {
+                if ($_ -is [System.Management.Automation.ErrorRecord]) { $SourceStderr = $_.ToString() } else { $_ }
+            }
             if (-not $SourceCheck) {
-                throw "Source account '$($Source.AccountName)' not found in RG '$($Source.ResourceGroup)'."
+                if ($SourceStderr -match "(?i)connect|timeout|network|socket|resolve|SSL|handshake|ENETUNREACH|ECONNREFUSED|ECONNRESET|ETIMEDOUT") {
+                    throw "Network error validating source account '$($Source.AccountName)': $SourceStderr"
+                } elseif ($SourceStderr) {
+                    throw "Source account '$($Source.AccountName)' not found in RG '$($Source.ResourceGroup)'. Azure CLI error: $SourceStderr"
+                } else {
+                    throw "Source account '$($Source.AccountName)' not found in RG '$($Source.ResourceGroup)'."
+                }
             }
             $SourceProps = $SourceCheck | ConvertFrom-Json
             $SourceDefaultAction   = if ($SourceProps.defaultAction) { $SourceProps.defaultAction } else { "Allow" }
@@ -721,9 +730,18 @@ try {
             # ── Step 3: Look up destination account ──
             Write-Log "  Looking up destination: $DestAccountName..." "" $Progress
             az account set --subscription $DestSubId | Out-Null
-            $DestCheck = az storage account show --name $DestAccountName --resource-group $DestRGName --query "{name:name, kind:kind, defaultAction:networkRuleSet.defaultAction, publicNetworkAccess:publicNetworkAccess, allowSharedKeyAccess:allowSharedKeyAccess}" -o json 2>$null
+            $DestStderr = $null
+            $DestCheck = az storage account show --name $DestAccountName --resource-group $DestRGName --query "{name:name, kind:kind, defaultAction:networkRuleSet.defaultAction, publicNetworkAccess:publicNetworkAccess, allowSharedKeyAccess:allowSharedKeyAccess}" -o json 2>&1 | ForEach-Object {
+                if ($_ -is [System.Management.Automation.ErrorRecord]) { $DestStderr = $_.ToString() } else { $_ }
+            }
             if (-not $DestCheck) {
-                throw "Destination account '$DestAccountName' not found in RG '$DestRGName' (sub: $DestSubId). Create it first using Create-DRFileShareAccounts.ps1."
+                if ($DestStderr -match "(?i)connect|timeout|network|socket|resolve|SSL|handshake|ENETUNREACH|ECONNREFUSED|ECONNRESET|ETIMEDOUT") {
+                    throw "Network error validating destination account '$DestAccountName': $DestStderr"
+                } elseif ($DestStderr) {
+                    throw "Destination account '$DestAccountName' not found in RG '$DestRGName' (sub: $DestSubId). Azure CLI error: $DestStderr"
+                } else {
+                    throw "Destination account '$DestAccountName' not found in RG '$DestRGName' (sub: $DestSubId). Create it first using Create-DRFileShareAccounts.ps1."
+                }
             }
             $DestProps = $DestCheck | ConvertFrom-Json
             $DestKind            = if ($DestProps.kind) { $DestProps.kind } else { "StorageV2" }
