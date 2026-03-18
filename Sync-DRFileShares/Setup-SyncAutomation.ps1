@@ -784,9 +784,10 @@ try {
         Write-Log "  [DRYRUN] Would enable System-Assigned Managed Identity" "DRYRUN"
     } else {
         $MIResult = Invoke-AzCommand -Arguments @(
-            "automation", "account", "update",
+            "resource", "update",
             "--name", $AutomationAccountName,
             "--resource-group", $ResourceGroupName,
+            "--resource-type", "Microsoft.Automation/automationAccounts",
             "--set", "identity.type=SystemAssigned",
             "-o", "json"
         )
