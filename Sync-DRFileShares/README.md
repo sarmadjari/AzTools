@@ -156,7 +156,7 @@ This creates and configures:
 | Resource | Details |
 |---|---|
 | Automation Account | Hosts the Runbook, schedule, and variables |
-| VM (auto-created if needed) | Small Linux VM (Standard_B2s) — override with `-VMSize` / `-VMOsType` |
+| VM (auto-created if needed) | Small Linux VM (Standard_B2s). Name is auto-generated based on the Automation Account name but can be overridden with `-HybridWorkerVMName`. Size/OS can be overridden with `-VMSize` / `-VMOsType`. |
 | System-Assigned Managed Identity | Secure auth — no credentials stored |
 | Hybrid Runbook Worker | VM-based execution (azcopy requires a real host, not a cloud sandbox) |
 | Recurring schedule | Configurable interval (default: every 6 hours) |
