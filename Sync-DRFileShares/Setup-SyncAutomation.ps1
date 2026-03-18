@@ -1086,23 +1086,38 @@ try {
     $RBACAssigned = 0
     $RBACSkipped = 0
 
+    if (-not $DryRun) {
+        # Fetch ALL existing role assignments per principal in one call each (instead of 1 call per scope)
+        foreach ($Principal in $PrincipalsToAssign) {
+            Write-Log "  Checking existing RBAC for $($Principal.Label)..."
+            $ExistingRoles = Invoke-AzCommand -Arguments @(
+                "role", "assignment", "list",
+                "--assignee", $Principal.Id,
+                "--role", $RoleName,
+                "--query", "[].scope",
+                "-o", "json"
+            ) -IgnoreExitCode
+
+            $ExistingScopes = @{}
+            if ($ExistingRoles.StdOut) {
+                $ScopeList = $ExistingRoles.StdOut | ConvertFrom-Json
+                foreach ($S in $ScopeList) {
+                    $ExistingScopes[$S.ToLower()] = $true
+                }
+            }
+            # Attach the lookup to the principal for use in the loop
+            $Principal.ExistingScopes = $ExistingScopes
+            Write-Log "  Found $($ExistingScopes.Count) existing '$RoleName' assignment(s) for $($Principal.Label)."
+        }
+    }
+
     foreach ($Scope in $UniqueRGScopes.Keys) {
         $ScopeType = $UniqueRGScopes[$Scope]
         foreach ($Principal in $PrincipalsToAssign) {
             if ($DryRun) {
                 Write-Log "  [DRYRUN] Would assign '$RoleName' to $($Principal.Label) ($($Principal.Id)) at $ScopeType scope: $Scope" "DRYRUN"
             } else {
-                # Check if assignment already exists before creating
-                $ExistingCheck = Invoke-AzCommand -Arguments @(
-                    "role", "assignment", "list",
-                    "--assignee", $Principal.Id,
-                    "--role", $RoleName,
-                    "--scope", $Scope,
-                    "--query", "length(@)",
-                    "-o", "tsv"
-                ) -IgnoreExitCode
-
-                if ($ExistingCheck.StdOut -and [int]$ExistingCheck.StdOut.Trim() -gt 0) {
+                if ($Principal.ExistingScopes -and $Principal.ExistingScopes.ContainsKey($Scope.ToLower())) {
                     $RBACSkipped++
                 } else {
                     Write-Log "  Assigning '$RoleName' to $($Principal.Label) at $ScopeType scope: $Scope..."
