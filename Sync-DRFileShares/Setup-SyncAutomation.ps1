@@ -846,7 +846,15 @@ try {
         Write-Log "Creating Hybrid Worker VM '$HybridWorkerVMName' ($VMOsType, $VMSize)..."
 
         if ($DryRun) {
+            $DryRunOsDiskName = "$HybridWorkerVMName-osdisk"
+            $DryRunNicName    = "$HybridWorkerVMName-nic"
+            $DryRunVNetName   = "$HybridWorkerVMName-vnet"
+            $DryRunNSGName    = "$HybridWorkerVMName-nsg"
             Write-Log "  [DRYRUN] Would create VM '$HybridWorkerVMName' (size: $VMSize, os: $VMOsType) in '$ResourceGroupName'" "DRYRUN"
+            Write-Log "  [DRYRUN]   OS Disk : $DryRunOsDiskName" "DRYRUN"
+            Write-Log "  [DRYRUN]   NIC     : $DryRunNicName" "DRYRUN"
+            Write-Log "  [DRYRUN]   VNET    : $DryRunVNetName" "DRYRUN"
+            Write-Log "  [DRYRUN]   NSG     : $DryRunNSGName" "DRYRUN"
             Write-Log "  [DRYRUN] Would enable System-Assigned MI on VM '$HybridWorkerVMName'" "DRYRUN"
             Write-Log "  [DRYRUN] Would check and install prerequisites (az cli, azcopy, pwsh) on VM" "DRYRUN"
             Write-Log "  [DRYRUN] Would create Hybrid Worker Group '$EffectiveWorkerGroup'" "DRYRUN"
@@ -863,8 +871,60 @@ try {
             if ($VMCheck.ExitCode -eq 0) {
                 Write-Log "  VM '$HybridWorkerVMName' already exists. Reusing." "SUCCESS"
             } else {
-                # Create the VM
+                # Create the VM with clean resource names
                 $Image = if ($VMOsType -eq "Linux") { "Ubuntu2204" } else { "Win2022Datacenter" }
+
+                # Derive clean names for all VM-related resources
+                $OsDiskName = "$HybridWorkerVMName-osdisk"
+                $NicName    = "$HybridWorkerVMName-nic"
+                $VNetName   = "$HybridWorkerVMName-vnet"
+                $NSGName    = "$HybridWorkerVMName-nsg"
+                $SubnetName = "default"
+
+                Write-Log "  Creating networking resources for VM '$HybridWorkerVMName'..."
+
+                # Create NSG
+                Write-Log "    Creating NSG '$NSGName'..."
+                $NSGCreate = Invoke-AzCommand -Arguments @(
+                    "network", "nsg", "create",
+                    "--name", $NSGName,
+                    "--resource-group", $ResourceGroupName,
+                    "--location", $Location,
+                    "-o", "none"
+                ) -IgnoreExitCode
+                if ($NSGCreate.ExitCode -ne 0) {
+                    Write-Log "    NSG may already exist, continuing..." "WARN"
+                }
+
+                # Create VNET with subnet
+                Write-Log "    Creating VNET '$VNetName' with subnet '$SubnetName'..."
+                $VNetCreate = Invoke-AzCommand -Arguments @(
+                    "network", "vnet", "create",
+                    "--name", $VNetName,
+                    "--resource-group", $ResourceGroupName,
+                    "--location", $Location,
+                    "--subnet-name", $SubnetName,
+                    "-o", "none"
+                ) -IgnoreExitCode
+                if ($VNetCreate.ExitCode -ne 0) {
+                    Write-Log "    VNET may already exist, continuing..." "WARN"
+                }
+
+                # Create NIC attached to subnet and NSG
+                Write-Log "    Creating NIC '$NicName'..."
+                $NicCreate = Invoke-AzCommand -Arguments @(
+                    "network", "nic", "create",
+                    "--name", $NicName,
+                    "--resource-group", $ResourceGroupName,
+                    "--location", $Location,
+                    "--vnet-name", $VNetName,
+                    "--subnet", $SubnetName,
+                    "--network-security-group", $NSGName,
+                    "-o", "none"
+                ) -IgnoreExitCode
+                if ($NicCreate.ExitCode -ne 0) {
+                    Write-Log "    NIC may already exist, continuing..." "WARN"
+                }
 
                 $azVmArgs = @(
                     "vm", "create",
@@ -876,6 +936,8 @@ try {
                     "--assign-identity",
                     "--admin-username", "azadmin",
                     "--public-ip-address", "",
+                    "--os-disk-name", $OsDiskName,
+                    "--nics", $NicName,
                     "-o", "json"
                 )
 
@@ -902,6 +964,33 @@ try {
                 if ($VMOsType -eq "Windows") {
                     Write-Log "  Admin credentials: username=azadmin (password shown once, store securely)" "WARN"
                     Write-Log "  Admin password: $VMPassword" "WARN"
+                }
+
+                # Wait for the VM guest agent to become ready before running commands
+                Write-Log "  Waiting for VM guest agent to become ready..."
+                $AgentReady = $false
+                $AgentWaitMax = 120
+                $AgentWaitElapsed = 0
+                while ($AgentWaitElapsed -lt $AgentWaitMax) {
+                    Start-Sleep -Seconds 15
+                    $AgentWaitElapsed += 15
+                    $AgentCheck = Invoke-AzCommand -Arguments @(
+                        "vm", "get-instance-view",
+                        "--name", $HybridWorkerVMName,
+                        "--resource-group", $ResourceGroupName,
+                        "--query", "instanceView.vmAgent.statuses[0].displayStatus",
+                        "-o", "tsv"
+                    ) -IgnoreExitCode
+                    if ($AgentCheck.StdOut -and $AgentCheck.StdOut.Trim() -eq "Ready") {
+                        $AgentReady = $true
+                        break
+                    }
+                    Write-Log "    Agent not ready yet (${AgentWaitElapsed}s elapsed)..."
+                }
+                if ($AgentReady) {
+                    Write-Log "  VM guest agent is ready." "SUCCESS"
+                } else {
+                    Write-Log "  WARNING: VM guest agent did not report ready within ${AgentWaitMax}s. Proceeding anyway..." "WARN"
                 }
             }
 
@@ -1071,7 +1160,7 @@ try {
         $RunbookBody = @{
             location = $Location
             properties = @{
-                runbookType        = "PowerShell"
+                runbookType        = "PowerShell7"
                 runtimeEnvironment = $RuntimeEnvName
                 description        = "Syncs Azure File Shares from source to destination using AzCopy (Managed Identity auth)."
             }
