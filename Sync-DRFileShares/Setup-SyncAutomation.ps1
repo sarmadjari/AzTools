@@ -45,25 +45,22 @@
     Path to the CSV mapping file with headers:
     SourceResourceId, DestStorageAccountName, DestResourceGroupName
 
-.PARAMETER HybridWorkerGroup
-    Name of an existing Hybrid Worker Group to target. Mutually exclusive with
-    -HybridWorkerVMResourceId.
-
 .PARAMETER HybridWorkerVMResourceId
-    ARM Resource ID of a VM to register as a Hybrid Runbook Worker. The script
-    enables the VM's Managed Identity, checks and installs any missing
+    ARM Resource ID of an existing VM to use as a Hybrid Runbook Worker. The
+    script enables the VM's Managed Identity, checks and installs any missing
     prerequisites (az cli, azcopy, pwsh) on the VM, installs the Hybrid
     Worker extension, and creates a worker group named "hwg-sync-dr-fileshares".
-    Mutually exclusive with -HybridWorkerGroup.
+    When omitted, a new VM is created automatically.
 
 .PARAMETER HybridWorkerVMName
     Custom name for the auto-created Hybrid Worker VM. If omitted, a name is
-    auto-generated from the Automation Account name (e.g., "vm-hwk-aadrsync").
-    Only used when neither -HybridWorkerGroup nor -HybridWorkerVMResourceId is provided.
+    auto-generated from the Automation Account name (e.g., "ahb-szn-prd-ndbp-filesync-dr-vm").
+    Max length: 64 characters (Azure VM resource name limit).
+    Only used when -HybridWorkerVMResourceId is not provided.
 
 .PARAMETER VMSize
     VM size for auto-created Hybrid Worker VM (default: Standard_B2s).
-    Only used when neither -HybridWorkerGroup nor -HybridWorkerVMResourceId is provided.
+    Only used when -HybridWorkerVMResourceId is not provided.
 
 .PARAMETER VMOsType
     OS type for auto-created VM: Linux (default) or Windows.
@@ -95,15 +92,15 @@
     Switch. Dry run — shows what would be created without making changes.
 
 .EXAMPLE
-    # Basic setup with an existing Hybrid Worker Group
-    .\Setup-SyncAutomation.ps1 -AutomationAccountName "aa-dr-sync" -ResourceGroupName "rg-automation" -Location "switzerlandnorth" -CsvPath ".\resources.csv" -HybridWorkerGroup "my-worker-group"
-
-.EXAMPLE
-    # Register a VM as Hybrid Worker and set up everything
+    # Use an existing VM as Hybrid Worker
     .\Setup-SyncAutomation.ps1 -AutomationAccountName "aa-dr-sync" -ResourceGroupName "rg-automation" -Location "switzerlandnorth" -CsvPath ".\resources.csv" -HybridWorkerVMResourceId "/subscriptions/.../Microsoft.Compute/virtualMachines/vm-worker01"
 
 .EXAMPLE
-    # Simplest setup — auto-creates a VM as Hybrid Worker
+    # Auto-create a VM with a custom name
+    .\Setup-SyncAutomation.ps1 -AutomationAccountName "aa-dr-sync" -ResourceGroupName "rg-automation" -Location "switzerlandnorth" -CsvPath ".\resources.csv" -HybridWorkerVMName "vm-dr-sync-worker" -ScheduleIntervalHours 4
+
+.EXAMPLE
+    # Simplest setup — auto-creates a VM with name derived from AutomationAccountName
     .\Setup-SyncAutomation.ps1 -AutomationAccountName "aa-dr-sync" -ResourceGroupName "rg-automation" -Location "switzerlandnorth" -CsvPath ".\resources.csv" -ScheduleIntervalHours 4
 
 .EXAMPLE
@@ -112,12 +109,12 @@
 
 .EXAMPLE
     # Cross-subscription, Mirror mode, every 4 hours
-    .\Setup-SyncAutomation.ps1 -AutomationAccountName "aa-dr-sync" -ResourceGroupName "rg-automation" -Location "switzerlandnorth" -CsvPath ".\resources.csv" -HybridWorkerGroup "my-worker-group" -DestSubscriptionId "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx" -SyncMode "Mirror" -ScheduleIntervalHours 4
+    .\Setup-SyncAutomation.ps1 -AutomationAccountName "aa-dr-sync" -ResourceGroupName "rg-automation" -Location "switzerlandnorth" -CsvPath ".\resources.csv" -HybridWorkerVMResourceId "/subscriptions/.../Microsoft.Compute/virtualMachines/vm-worker01" -DestSubscriptionId "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx" -SyncMode "Mirror" -ScheduleIntervalHours 4
 
 .NOTES
     Author  : Sarmad Jari
-    Version : 1.1
-    Date    : 2026-03-12
+    Version : 1.2
+    Date    : 2026-03-19
     License : MIT License (https://opensource.org/licenses/MIT)
 
     DISCLAIMER
@@ -164,7 +161,7 @@
       - Validating storage account pairs and file share mappings against your
         organisational standards
       - Verifying RBAC assignments and Managed Identity permissions
-      - Verifying the Hybrid Worker VM prerequisites if using -HybridWorkerGroup
+      - Verifying the Hybrid Worker VM prerequisites
         (auto-installed when using -HybridWorkerVMResourceId or auto-created VM)
       - Applying appropriate security hardening, access controls, network restrictions,
         and compliance policies
@@ -185,13 +182,12 @@ param (
     [Parameter(Mandatory=$true)][string]$ResourceGroupName,
     [Parameter(Mandatory=$true)][string]$Location,
     [Parameter(Mandatory=$true)][string]$CsvPath,
-    [Parameter(Mandatory=$false)][string]$HybridWorkerGroup,
     [Parameter(Mandatory=$false)][string]$HybridWorkerVMResourceId,
     [Parameter(Mandatory=$false)][string]$HybridWorkerVMName,
     [Parameter(Mandatory=$false)][string]$VMSize = "Standard_B2s",
     [Parameter(Mandatory=$false)][ValidateSet("Linux","Windows")][string]$VMOsType = "Linux",
     [Parameter(Mandatory=$false)][string]$DestSubscriptionId,
-    [Parameter(Mandatory=$false)][ValidateRange(1,24)][int]$ScheduleIntervalHours = 6,
+    [Parameter(Mandatory=$false)][ValidateRange(1,24)][int]$ScheduleIntervalHours = 12,
     [Parameter(Mandatory=$false)][ValidateSet("Additive","Mirror")][string]$SyncMode = "Additive",
     [switch]$PreserveSmbPermissions,
     [string]$ExcludePattern,
@@ -592,9 +588,9 @@ try {
     $CurrentAccount = $LoginCheck.StdOut | ConvertFrom-Json
     Write-Log "  Logged in as: $($CurrentAccount.user.name) (subscription: $($CurrentAccount.name))"
 
-    # Mutual exclusivity check
-    if ($HybridWorkerGroup -and $HybridWorkerVMResourceId) {
-        throw "Cannot specify both -HybridWorkerGroup and -HybridWorkerVMResourceId. Use one or the other."
+    # Validate HybridWorkerVMName is only used when not providing a VM Resource ID
+    if ($HybridWorkerVMName -and $HybridWorkerVMResourceId) {
+        throw "Cannot specify both -HybridWorkerVMName and -HybridWorkerVMResourceId. Use -HybridWorkerVMResourceId for an existing VM, or -HybridWorkerVMName to create a new one."
     }
 
     # Check CSV file
@@ -800,12 +796,12 @@ try {
     }
 
     # ── Step 5: Hybrid Worker setup ───────────────────────────────
-    $EffectiveWorkerGroup = $null
+    $EffectiveWorkerGroup = "hwg-sync-dr-fileshares"
     $VMPrincipalId = $null
     $VMCreatedByScript = $false
 
     if ($HybridWorkerVMResourceId) {
-        # ── Option A: Use an existing VM as Hybrid Worker ──
+        # ── Path 1: Use an existing VM as Hybrid Worker ──
         Write-Log "Setting up Hybrid Runbook Worker from existing VM..."
 
         # Parse VM resource ID
@@ -815,7 +811,6 @@ try {
         $VMSubId = $Matches[1]
         $VMRGName = $Matches[2]
         $HybridWorkerVMName = $Matches[3]
-        $EffectiveWorkerGroup = "hwg-sync-dr-fileshares"
 
         if ($DryRun) {
             Write-Log "  [DRYRUN] Would enable System-Assigned MI on VM '$HybridWorkerVMName'" "DRYRUN"
@@ -834,43 +829,21 @@ try {
             $VMPrincipalId = $HWResult.VMPrincipalId
         }
 
-    } elseif ($HybridWorkerGroup) {
-        # ── Option B: Use an existing Hybrid Worker Group ──
-        $EffectiveWorkerGroup = $HybridWorkerGroup
-        Write-Log "Using existing Hybrid Worker Group: '$HybridWorkerGroup'"
-
-        if (-not $DryRun) {
-            $HWGCheck = Invoke-AzCommand -Arguments @(
-                "automation", "hrwg", "show",
-                "--automation-account-name", $AutomationAccountName,
-                "--resource-group", $ResourceGroupName,
-                "--name", $HybridWorkerGroup,
-                "-o", "json"
-            ) -IgnoreExitCode
-            if ($HWGCheck.ExitCode -ne 0) {
-                Write-Log "  WARNING: Hybrid Worker Group '$HybridWorkerGroup' not found on this Automation Account." "WARN"
-                Write-Log "  The group may be created later, or the Runbook can be linked after creation." "WARN"
-            } else {
-                Write-Log "  Hybrid Worker Group validated." "SUCCESS"
-            }
-        }
-
     } else {
-        # ── Option C: Auto-create a VM as Hybrid Worker ──
-        $MaxVMNameLength = if ($VMOsType -eq "Windows") { 15 } else { 64 }
+        # ── Path 2: Create a new VM as Hybrid Worker ──
         if ([string]::IsNullOrWhiteSpace($HybridWorkerVMName)) {
-            $HybridWorkerVMName = "vm-hwk-$($AutomationAccountName.ToLower() -replace '[^a-z0-9]','')"
-            if ($HybridWorkerVMName.Length -gt $MaxVMNameLength) {
-                $HybridWorkerVMName = $HybridWorkerVMName.Substring(0, $MaxVMNameLength)
+            # Auto-generate VM name from AutomationAccountName by appending "-vm"
+            $HybridWorkerVMName = "$($AutomationAccountName.ToLower())-vm"
+            if ($HybridWorkerVMName.Length -gt 64) {
+                $HybridWorkerVMName = $HybridWorkerVMName.Substring(0, 64)
             }
-        } elseif ($HybridWorkerVMName.Length -gt $MaxVMNameLength) {
-            throw "VM name '$HybridWorkerVMName' exceeds the maximum length of $MaxVMNameLength characters for $VMOsType VMs."
+        } elseif ($HybridWorkerVMName.Length -gt 64) {
+            throw "VM name '$HybridWorkerVMName' exceeds the maximum Azure VM resource name length of 64 characters."
         }
 
-        $EffectiveWorkerGroup = "hwg-sync-dr-fileshares"
         $AASubId = $CurrentAccount.id
 
-        Write-Log "No Hybrid Worker specified. Auto-creating VM '$HybridWorkerVMName' ($VMOsType, $VMSize)..."
+        Write-Log "Creating Hybrid Worker VM '$HybridWorkerVMName' ($VMOsType, $VMSize)..."
 
         if ($DryRun) {
             Write-Log "  [DRYRUN] Would create VM '$HybridWorkerVMName' (size: $VMSize, os: $VMOsType) in '$ResourceGroupName'" "DRYRUN"
@@ -979,82 +952,106 @@ try {
         }
     }
 
-    # ── Step 7: Import Az modules into Automation Account ─────────
-    Write-Log "Importing PowerShell modules into Automation Account (runtime 7.2)..."
+    # ── Step 7: Create Runtime Environment (PowerShell 7.4) ──────
+    $RuntimeEnvName = "PowerShell-7.4"
+    $AASubId = $CurrentAccount.id
+    $ApiVersion = "2024-10-23"
 
-    $ModulesToImport = @(
-        @{ Name = "Az.Accounts"; ContentUri = "https://www.powershellgallery.com/api/v2/package/Az.Accounts" },
-        @{ Name = "Az.Storage";  ContentUri = "https://www.powershellgallery.com/api/v2/package/Az.Storage" }
-    )
+    Write-Log "Creating Runtime Environment '$RuntimeEnvName' with Az modules..."
 
-    foreach ($Module in $ModulesToImport) {
-        if ($DryRun) {
-            Write-Log "  [DRYRUN] Would import module $($Module.Name) (runtime 7.2)" "DRYRUN"
-        } else {
-            Write-Log "  Importing module $($Module.Name)..."
-
-            # Use ARM REST API to import module with runtime version 7.2
-            $AASubId = $CurrentAccount.id
-            $ModuleApiUrl = "https://management.azure.com/subscriptions/$AASubId/resourceGroups/$ResourceGroupName/providers/Microsoft.Automation/automationAccounts/$AutomationAccountName/powerShell72Modules/$($Module.Name)?api-version=2023-11-01"
-            $ModuleBody = @{
-                properties = @{
-                    contentLink = @{
-                        uri = $Module.ContentUri
-                    }
+    if ($DryRun) {
+        Write-Log "  [DRYRUN] Would create Runtime Environment '$RuntimeEnvName' (PowerShell 7.4, Az 12.3.0)" "DRYRUN"
+        Write-Log "  [DRYRUN] Would add package Az.Storage to Runtime Environment" "DRYRUN"
+    } else {
+        # Create Runtime Environment (includes Az 12.3.0 by default)
+        $RTEApiUrl = "https://management.azure.com/subscriptions/$AASubId/resourceGroups/$ResourceGroupName/providers/Microsoft.Automation/automationAccounts/$AutomationAccountName/runtimeEnvironments/$RuntimeEnvName`?api-version=$ApiVersion"
+        $RTEBody = @{
+            location   = $Location
+            properties = @{
+                runtime = @{
+                    language = "PowerShell"
+                    version  = "7.4"
                 }
-            } | ConvertTo-Json -Depth 5
-
-            $ModuleResult = Invoke-AzCommand -Arguments @(
-                "rest", "--method", "PUT",
-                "--url", $ModuleApiUrl,
-                "--body", $ModuleBody,
-                "--headers", "Content-Type=application/json",
-                "-o", "none"
-            ) -IgnoreExitCode
-
-            if ($ModuleResult.ExitCode -eq 0) {
-                Write-Log "  Module $($Module.Name) import initiated." "SUCCESS"
-            } else {
-                Write-Log "  WARNING: Module $($Module.Name) import may have failed: $($ModuleResult.ErrorDetail)" "WARN"
-                Write-Log "  The module may already be available. Continuing..." "WARN"
+                defaultPackages = @{
+                    Az = "12.3.0"
+                }
+                description = "PowerShell 7.4 runtime for DR File Share sync (managed by Setup-SyncAutomation.ps1)"
             }
-        }
-    }
+        } | ConvertTo-Json -Depth 5
 
-    # Wait for Az.Accounts to provision before Az.Storage can use it
-    if (-not $DryRun) {
-        Write-Log "  Waiting for Az.Accounts module to provision (may take 2-5 minutes)..."
+        $RTEResult = Invoke-AzCommand -Arguments @(
+            "rest", "--method", "PUT",
+            "--url", $RTEApiUrl,
+            "--body", $RTEBody,
+            "--headers", "Content-Type=application/json",
+            "-o", "none"
+        ) -IgnoreExitCode
+
+        if ($RTEResult.ExitCode -eq 0) {
+            Write-Log "  Runtime Environment '$RuntimeEnvName' created." "SUCCESS"
+        } else {
+            Write-Log "  WARNING: Runtime Environment creation may have failed: $($RTEResult.ErrorDetail)" "WARN"
+            Write-Log "  The runtime environment may already exist. Continuing..." "WARN"
+        }
+
+        # Add Az.Storage package explicitly (Az default package may not include all sub-modules)
+        $PkgApiUrl = "https://management.azure.com/subscriptions/$AASubId/resourceGroups/$ResourceGroupName/providers/Microsoft.Automation/automationAccounts/$AutomationAccountName/runtimeEnvironments/$RuntimeEnvName/packages/Az.Storage`?api-version=$ApiVersion"
+        $PkgBody = @{
+            properties = @{
+                contentLink = @{
+                    uri = "https://www.powershellgallery.com/api/v2/package/Az.Storage"
+                }
+            }
+        } | ConvertTo-Json -Depth 5
+
+        $PkgResult = Invoke-AzCommand -Arguments @(
+            "rest", "--method", "PUT",
+            "--url", $PkgApiUrl,
+            "--body", $PkgBody,
+            "--headers", "Content-Type=application/json",
+            "-o", "none"
+        ) -IgnoreExitCode
+
+        if ($PkgResult.ExitCode -eq 0) {
+            Write-Log "  Package Az.Storage added to Runtime Environment." "SUCCESS"
+        } else {
+            Write-Log "  WARNING: Az.Storage package may have failed: $($PkgResult.ErrorDetail)" "WARN"
+            Write-Log "  The package may already be available. Continuing..." "WARN"
+        }
+
+        # Wait for Runtime Environment to provision
+        Write-Log "  Waiting for Runtime Environment to provision (may take 2-5 minutes)..."
         $MaxWaitSeconds = 300
         $ElapsedSeconds = 0
-        $ModuleReady = $false
+        $RTEReady = $false
 
         while ($ElapsedSeconds -lt $MaxWaitSeconds) {
             Start-Sleep -Seconds 15
             $ElapsedSeconds += 15
 
-            $ModuleCheck = Invoke-AzCommand -Arguments @(
+            $RTECheck = Invoke-AzCommand -Arguments @(
                 "rest", "--method", "GET",
-                "--url", "https://management.azure.com/subscriptions/$AASubId/resourceGroups/$ResourceGroupName/providers/Microsoft.Automation/automationAccounts/$AutomationAccountName/powerShell72Modules/Az.Accounts?api-version=2023-11-01",
+                "--url", $RTEApiUrl,
                 "-o", "json"
             ) -IgnoreExitCode
 
-            if ($ModuleCheck.ExitCode -eq 0 -and $ModuleCheck.StdOut) {
-                $ModuleState = ($ModuleCheck.StdOut | ConvertFrom-Json).properties.provisioningState
-                if ($ModuleState -eq "Succeeded") {
-                    Write-Log "  Az.Accounts module ready." "SUCCESS"
-                    $ModuleReady = $true
+            if ($RTECheck.ExitCode -eq 0 -and $RTECheck.StdOut) {
+                $RTEState = ($RTECheck.StdOut | ConvertFrom-Json).properties.provisioningState
+                if ($RTEState -eq "Succeeded") {
+                    Write-Log "  Runtime Environment ready." "SUCCESS"
+                    $RTEReady = $true
                     break
-                } elseif ($ModuleState -eq "Failed") {
-                    Write-Log "  WARNING: Az.Accounts module provisioning failed." "WARN"
+                } elseif ($RTEState -eq "Failed") {
+                    Write-Log "  WARNING: Runtime Environment provisioning failed." "WARN"
                     break
                 }
-                Write-Log "  Az.Accounts provisioning state: $ModuleState (${ElapsedSeconds}s elapsed)..."
+                Write-Log "  Runtime Environment provisioning state: $RTEState (${ElapsedSeconds}s elapsed)..."
             }
         }
 
-        if (-not $ModuleReady) {
-            Write-Log "  WARNING: Az.Accounts module provisioning did not complete within ${MaxWaitSeconds}s." "WARN"
-            Write-Log "  Az.Storage may fail to import. Check the Automation Account modules in the portal." "WARN"
+        if (-not $RTEReady) {
+            Write-Log "  WARNING: Runtime Environment provisioning did not complete within ${MaxWaitSeconds}s." "WARN"
+            Write-Log "  Check the Automation Account in the portal." "WARN"
         }
     }
 
@@ -1064,19 +1061,19 @@ try {
 
     if ($DryRun) {
         Write-Log "  [DRYRUN] Would import runbook from: $RunbookPath" "DRYRUN"
-        Write-Log "  [DRYRUN] Would publish runbook: $RunbookName" "DRYRUN"
+        Write-Log "  [DRYRUN] Would publish runbook: $RunbookName (Runtime Environment: $RuntimeEnvName)" "DRYRUN"
     } else {
-        # Import the runbook using ARM REST API (supports PowerShell 7.2 runtime)
-        $AASubId = $CurrentAccount.id
+        # Import the runbook using ARM REST API with Runtime Environment (PowerShell 7.4)
         $RunbookContent = Get-Content $RunbookPath -Raw
 
-        # Create/update runbook definition
-        $RunbookApiUrl = "https://management.azure.com/subscriptions/$AASubId/resourceGroups/$ResourceGroupName/providers/Microsoft.Automation/automationAccounts/$AutomationAccountName/runbooks/$RunbookName`?api-version=2023-11-01"
+        # Create/update runbook definition linked to Runtime Environment
+        $RunbookApiUrl = "https://management.azure.com/subscriptions/$AASubId/resourceGroups/$ResourceGroupName/providers/Microsoft.Automation/automationAccounts/$AutomationAccountName/runbooks/$RunbookName`?api-version=$ApiVersion"
         $RunbookBody = @{
             location = $Location
             properties = @{
-                runbookType = "PowerShell7"
-                description = "Syncs Azure File Shares from source to destination using AzCopy (Managed Identity auth)."
+                runbookType        = "PowerShell"
+                runtimeEnvironment = $RuntimeEnvName
+                description        = "Syncs Azure File Shares from source to destination using AzCopy (Managed Identity auth)."
             }
         } | ConvertTo-Json -Depth 5
 
@@ -1092,7 +1089,7 @@ try {
         }
 
         # Upload runbook content (draft)
-        $DraftUrl = "https://management.azure.com/subscriptions/$AASubId/resourceGroups/$ResourceGroupName/providers/Microsoft.Automation/automationAccounts/$AutomationAccountName/runbooks/$RunbookName/draft/content?api-version=2023-11-01"
+        $DraftUrl = "https://management.azure.com/subscriptions/$AASubId/resourceGroups/$ResourceGroupName/providers/Microsoft.Automation/automationAccounts/$AutomationAccountName/runbooks/$RunbookName/draft/content?api-version=$ApiVersion"
 
         # Write content to a temp file for upload
         $TempRunbookFile = [System.IO.Path]::GetTempFileName()
@@ -1114,7 +1111,7 @@ try {
         }
 
         # Publish the runbook
-        $PublishUrl = "https://management.azure.com/subscriptions/$AASubId/resourceGroups/$ResourceGroupName/providers/Microsoft.Automation/automationAccounts/$AutomationAccountName/runbooks/$RunbookName/publish?api-version=2023-11-01"
+        $PublishUrl = "https://management.azure.com/subscriptions/$AASubId/resourceGroups/$ResourceGroupName/providers/Microsoft.Automation/automationAccounts/$AutomationAccountName/runbooks/$RunbookName/publish?api-version=$ApiVersion"
         $Publish = Invoke-AzCommand -Arguments @(
             "rest", "--method", "POST",
             "--url", $PublishUrl,
@@ -1125,7 +1122,7 @@ try {
             throw "Failed to publish runbook: $($Publish.ErrorDetail)"
         }
 
-        Write-Log "  Runbook '$RunbookName' imported and published." "SUCCESS"
+        Write-Log "  Runbook '$RunbookName' imported and published (Runtime: $RuntimeEnvName)." "SUCCESS"
     }
 
     # ── Step 9: Store CSV and config as Automation Variables ───────
@@ -1148,7 +1145,7 @@ try {
         } else {
             # Use ARM REST API to create/update variables
             $AASubId = $CurrentAccount.id
-            $VarApiUrl = "https://management.azure.com/subscriptions/$AASubId/resourceGroups/$ResourceGroupName/providers/Microsoft.Automation/automationAccounts/$AutomationAccountName/variables/$($Var.Name)?api-version=2023-11-01"
+            $VarApiUrl = "https://management.azure.com/subscriptions/$AASubId/resourceGroups/$ResourceGroupName/providers/Microsoft.Automation/automationAccounts/$AutomationAccountName/variables/$($Var.Name)?api-version=$ApiVersion"
 
             $VarBody = @{
                 properties = @{
@@ -1186,7 +1183,7 @@ try {
         $AASubId = $CurrentAccount.id
 
         # Delete existing schedule if present (idempotent update)
-        $DelScheduleUrl = "https://management.azure.com/subscriptions/$AASubId/resourceGroups/$ResourceGroupName/providers/Microsoft.Automation/automationAccounts/$AutomationAccountName/schedules/$ScheduleName`?api-version=2023-11-01"
+        $DelScheduleUrl = "https://management.azure.com/subscriptions/$AASubId/resourceGroups/$ResourceGroupName/providers/Microsoft.Automation/automationAccounts/$AutomationAccountName/schedules/$ScheduleName`?api-version=$ApiVersion"
         Invoke-AzCommand -Arguments @(
             "rest", "--method", "DELETE",
             "--url", $DelScheduleUrl,
@@ -1195,7 +1192,7 @@ try {
 
         # Create schedule
         $ExpiryTime = (Get-Date).ToUniversalTime().AddYears(5).ToString("yyyy-MM-ddTHH:mm:ssZ")
-        $ScheduleApiUrl = "https://management.azure.com/subscriptions/$AASubId/resourceGroups/$ResourceGroupName/providers/Microsoft.Automation/automationAccounts/$AutomationAccountName/schedules/$ScheduleName`?api-version=2023-11-01"
+        $ScheduleApiUrl = "https://management.azure.com/subscriptions/$AASubId/resourceGroups/$ResourceGroupName/providers/Microsoft.Automation/automationAccounts/$AutomationAccountName/schedules/$ScheduleName`?api-version=$ApiVersion"
         $ScheduleBody = @{
             properties = @{
                 startTime   = $StartTime
@@ -1224,12 +1221,11 @@ try {
     Write-Log "Linking Runbook '$RunbookName' to schedule '$ScheduleName'..."
 
     if ($DryRun) {
-        $Target = if ($EffectiveWorkerGroup) { "Hybrid Worker: $EffectiveWorkerGroup" } else { "Cloud Sandbox (WARNING: azcopy not supported)" }
-        Write-Log "  [DRYRUN] Would link runbook to schedule (target: $Target)" "DRYRUN"
+        Write-Log "  [DRYRUN] Would link runbook to schedule (target: Hybrid Worker: $EffectiveWorkerGroup)" "DRYRUN"
     } else {
         $AASubId = $CurrentAccount.id
         $JobScheduleId = [guid]::NewGuid().ToString()
-        $JobScheduleUrl = "https://management.azure.com/subscriptions/$AASubId/resourceGroups/$ResourceGroupName/providers/Microsoft.Automation/automationAccounts/$AutomationAccountName/jobSchedules/$JobScheduleId`?api-version=2023-11-01"
+        $JobScheduleUrl = "https://management.azure.com/subscriptions/$AASubId/resourceGroups/$ResourceGroupName/providers/Microsoft.Automation/automationAccounts/$AutomationAccountName/jobSchedules/$JobScheduleId`?api-version=$ApiVersion"
 
         $JobScheduleBody = @{
             properties = @{
@@ -1275,10 +1271,11 @@ try {
         Write-Log "  VM created               : $HybridWorkerVMName ($VMSize, $VMOsType)"
     }
     Write-Log "  RBAC scopes              : $($UniqueRGScopes.Count) resource group(s)"
+    Write-Log "  Runtime Environment      : $RuntimeEnvName"
     Write-Log "  Runbook                  : $RunbookName"
     Write-Log "  Schedule                 : $ScheduleName (every ${ScheduleIntervalHours}h)"
     Write-Log "  SyncMode                 : $SyncMode"
-    Write-Log "  Run target               : $(if ($EffectiveWorkerGroup) { "Hybrid Worker: $EffectiveWorkerGroup" } else { '(dry-run)' })"
+    Write-Log "  Run target               : Hybrid Worker: $EffectiveWorkerGroup"
     Write-Log "  CSV rows                 : $TotalRows"
     Write-Log "  Total elapsed time       : $TotalDuration"
     Write-Log "=================================================================="
