@@ -280,8 +280,8 @@ $RehydrateInitiated     = 0
 $RehydrateFailed        = 0
 $HasFailures            = $false
 
-# ── CSV report rows ──────────────────────────────────────────────
-$CsvRows = @()
+# ── CSV report rows (List<T> for O(1) append — avoids O(n) array copy on every +=) ──
+$CsvRows = [System.Collections.Generic.List[PSCustomObject]]::new()
 
 # ── Main ─────────────────────────────────────────────────────────
 try {
@@ -333,7 +333,7 @@ try {
     Write-Log "Account found: kind=$($AccountInfo.kind), HNS=$IsHns, location=$($AccountInfo.location)"
 
     if ($AccountInfo.isHnsEnabled -eq $true) {
-        Write-Log "HNS-enabled (ADLS Gen2) account detected — using az storage fs commands for blob tier operations" "INFO"
+        Write-Log "HNS-enabled (ADLS Gen2) account detected." "INFO"
     }
 
     # ── Get account key ───────────────────────────────────────────
@@ -366,24 +366,14 @@ try {
     } else {
         Write-Log "Listing all containers..."
 
-        if ($AccountInfo.isHnsEnabled -eq $true) {
-            # HNS-enabled: use filesystem list
-            $ListResult = Invoke-AzCommand -Arguments @(
-                "storage", "fs", "list",
-                "--account-name", $StorageAccountName,
-                "--account-key", $AccountKey,
-                "--query", "[].name",
-                "-o", "tsv"
-            )
-        } else {
-            $ListResult = Invoke-AzCommand -Arguments @(
-                "storage", "container", "list",
-                "--account-name", $StorageAccountName,
-                "--account-key", $AccountKey,
-                "--query", "[].name",
-                "-o", "tsv"
-            )
-        }
+        # az storage container list works on both standard and HNS-enabled accounts
+        $ListResult = Invoke-AzCommand -Arguments @(
+            "storage", "container", "list",
+            "--account-name", $StorageAccountName,
+            "--account-key", $AccountKey,
+            "--query", "[].name",
+            "-o", "tsv"
+        )
 
         if (-not $ListResult.Success) {
             throw "Failed to list containers: $($ListResult.ErrorDetail)"
@@ -419,40 +409,24 @@ try {
 
         do {
             $PageNum++
+            $BatchStart = Get-Date
 
-            if ($AccountInfo.isHnsEnabled -eq $true) {
-                # HNS-enabled: use az storage fs file list (ADLS Gen2 / Data Lake)
-                $BlobArgs = @(
-                    "storage", "fs", "file", "list",
-                    "--file-system", $Container,
-                    "--account-name", $StorageAccountName,
-                    "--account-key", $AccountKey,
-                    "--num-results", "5000",
-                    "--query", "[].{name:name, contentLength:contentLength, lastModified:lastModified}",
-                    "-o", "json"
-                )
+            # Single API call per page: --show-next-marker returns both blobs and pagination
+            # marker in one response. JMESPath extracts only the 4 fields we need per blob.
+            # Works on both standard and HNS-enabled accounts.
+            $BlobArgs = @(
+                "storage", "blob", "list",
+                "--container-name", $Container,
+                "--account-name", $StorageAccountName,
+                "--account-key", $AccountKey,
+                "--num-results", "5000",
+                "--show-next-marker",
+                "-o", "json"
+            )
 
-                if ($Marker) {
-                    $BlobArgs += "--marker"
-                    $BlobArgs += $Marker
-                }
-            } else {
-                # Standard blob storage: use az storage blob list
-                $BlobArgs = @(
-                    "storage", "blob", "list",
-                    "--container-name", $Container,
-                    "--account-name", $StorageAccountName,
-                    "--account-key", $AccountKey,
-                    "--num-results", "5000",
-                    "--include", "metadata",
-                    "--query", "[].{name:name, properties:properties}",
-                    "-o", "json"
-                )
-
-                if ($Marker) {
-                    $BlobArgs += "--marker"
-                    $BlobArgs += $Marker
-                }
+            if ($Marker) {
+                $BlobArgs += "--marker"
+                $BlobArgs += $Marker
             }
 
             $BlobResult = Invoke-AzCommand -Arguments $BlobArgs
@@ -463,10 +437,29 @@ try {
                 break
             }
 
-            # Parse blob list
+            # Parse response — with --show-next-marker the output is an array where the
+            # last element may be a { nextMarker: "..." } object
+            $Marker = $null
             $Blobs = @()
+
             if ($BlobResult.StdOut -and $BlobResult.StdOut.Trim() -ne "[]") {
-                $Blobs = $BlobResult.StdOut | ConvertFrom-Json
+                $ParsedItems = $BlobResult.StdOut | ConvertFrom-Json
+
+                if ($ParsedItems.Count -gt 0) {
+                    $LastItem = $ParsedItems[-1]
+
+                    # Check if the last element is the nextMarker sentinel
+                    if ($LastItem.PSObject.Properties.Name -contains "nextMarker" -and
+                        -not ($LastItem.PSObject.Properties.Name -contains "name")) {
+                        $Marker = $LastItem.nextMarker
+                        # All items except the last are blobs
+                        if ($ParsedItems.Count -gt 1) {
+                            $Blobs = $ParsedItems[0..($ParsedItems.Count - 2)]
+                        }
+                    } else {
+                        $Blobs = $ParsedItems
+                    }
+                }
             }
 
             if ($Blobs.Count -eq 0) {
@@ -478,61 +471,27 @@ try {
 
             $ContainerBlobsScanned += $Blobs.Count
             $TotalBlobsScanned += $Blobs.Count
+            $BatchDuration = (Get-Date) - $BatchStart
+            $BlobsPerSec = if ($BatchDuration.TotalSeconds -gt 0) { [math]::Round($Blobs.Count / $BatchDuration.TotalSeconds) } else { $Blobs.Count }
 
-            # For HNS accounts, we need to check tier per-blob individually since
-            # az storage fs file list does not return tier info directly.
-            # For standard accounts, tier info is in the properties.
+            Write-Log "  Batch ${PageNum}: $($Blobs.Count) blobs listed in $([math]::Round($BatchDuration.TotalSeconds, 1))s (~$BlobsPerSec blobs/sec) | Running total: $ContainerBlobsScanned scanned, $ContainerArchiveCount Archive" "INFO" $ContainerProgress
+
+            # Update progress bar (visual-only, does not write to log)
+            $ProgressPct = if ($Marker) { -1 } else { 100 }
+            $ProgressMsg = "Container '$Container' — $ContainerBlobsScanned blobs scanned, $ContainerArchiveCount Archive found"
+            if ($ProgressPct -eq -1) {
+                Write-Progress -Activity "Scanning blobs" -Status $ProgressMsg -CurrentOperation "Batch $PageNum ($BlobsPerSec blobs/sec)"
+            } else {
+                Write-Progress -Activity "Scanning blobs" -Status $ProgressMsg -PercentComplete 100
+            }
+
             foreach ($Blob in $Blobs) {
                 $BlobName = $Blob.name
-                $BlobSize = 0
-                $BlobTier = ""
-                $RehydrationStatus = ""
-                $LastModified = ""
-
-                if ($AccountInfo.isHnsEnabled -eq $true) {
-                    # HNS: need to get blob properties individually to check tier
-                    # Use az storage fs file show for tier info
-                    $BlobSize = if ($Blob.contentLength) { [long]$Blob.contentLength } else { 0 }
-                    $LastModified = if ($Blob.lastModified) { $Blob.lastModified } else { "" }
-
-                    $PropResult = Invoke-AzCommand -Arguments @(
-                        "storage", "fs", "file", "show",
-                        "--file-system", $Container,
-                        "--path", $BlobName,
-                        "--account-name", $StorageAccountName,
-                        "--account-key", $AccountKey,
-                        "--query", "{contentLength:contentLength, metadata:metadata}",
-                        "-o", "json"
-                    ) -IgnoreExitCode
-
-                    # For HNS, check tier via the blob endpoint (az storage blob show)
-                    $TierResult = Invoke-AzCommand -Arguments @(
-                        "storage", "blob", "show",
-                        "--container-name", $Container,
-                        "--name", $BlobName,
-                        "--account-name", $StorageAccountName,
-                        "--account-key", $AccountKey,
-                        "--query", "{blobTier:properties.blobTier, rehydrationStatus:properties.rehydrationStatus, contentLength:properties.contentLength, lastModified:properties.lastModified}",
-                        "-o", "json"
-                    ) -IgnoreExitCode
-
-                    if ($TierResult.Success -and $TierResult.StdOut) {
-                        $TierInfo = $TierResult.StdOut | ConvertFrom-Json
-                        $BlobTier = if ($TierInfo.blobTier) { $TierInfo.blobTier } else { "" }
-                        $RehydrationStatus = if ($TierInfo.rehydrationStatus) { $TierInfo.rehydrationStatus } else { "" }
-                        if ($TierInfo.contentLength) { $BlobSize = [long]$TierInfo.contentLength }
-                        if ($TierInfo.lastModified) { $LastModified = $TierInfo.lastModified }
-                    } else {
-                        # Cannot determine tier — skip blob
-                        continue
-                    }
-                } else {
-                    # Standard: tier info is in properties
-                    $BlobTier = if ($Blob.properties.blobTier) { $Blob.properties.blobTier } else { "" }
-                    $RehydrationStatus = if ($Blob.properties.rehydrationStatus) { $Blob.properties.rehydrationStatus } else { "" }
-                    $BlobSize = if ($Blob.properties.contentLength) { [long]$Blob.properties.contentLength } else { 0 }
-                    $LastModified = if ($Blob.properties.lastModified) { $Blob.properties.lastModified } else { "" }
-                }
+                $Props = $Blob.properties
+                $BlobTier = if ($Props.blobTier) { $Props.blobTier } else { "" }
+                $RehydrationStatus = if ($Props.rehydrationStatus) { $Props.rehydrationStatus } else { "" }
+                $BlobSize = if ($Props.contentLength) { [long]$Props.contentLength } else { 0 }
+                $LastModified = if ($Props.lastModified) { $Props.lastModified } else { "" }
 
                 # Only interested in Archive tier blobs
                 if ($BlobTier -ne "Archive") {
@@ -550,7 +509,7 @@ try {
                     $AlreadyRehydrating++
                     Write-Log "  SKIP (already rehydrating): $BlobName [$SizeFormatted] — status: $RehydrationStatus" "WARN" $ContainerProgress
 
-                    $CsvRows += [PSCustomObject]@{
+                    $CsvRows.Add([PSCustomObject]@{
                         Container          = $Container
                         BlobName           = $BlobName
                         SizeBytes          = $BlobSize
@@ -560,7 +519,7 @@ try {
                         Status             = "Skipped-AlreadyRehydrating"
                         RehydrationStatus  = $RehydrationStatus
                         LastModified       = $LastModified
-                    }
+                    })
                     continue
                 }
 
@@ -568,7 +527,7 @@ try {
                 if ($DryRun) {
                     Write-Log "  WOULD REHYDRATE: $BlobName [$SizeFormatted] — Archive -> $TargetTier ($RehydratePriority priority)" "DRYRUN" $ContainerProgress
 
-                    $CsvRows += [PSCustomObject]@{
+                    $CsvRows.Add([PSCustomObject]@{
                         Container          = $Container
                         BlobName           = $BlobName
                         SizeBytes          = $BlobSize
@@ -578,7 +537,7 @@ try {
                         Status             = "DryRun-WouldRehydrate"
                         RehydrationStatus  = ""
                         LastModified       = $LastModified
-                    }
+                    })
                     continue
                 }
 
@@ -597,7 +556,7 @@ try {
                     $RehydrateInitiated++
                     Write-Log "  REHYDRATE INITIATED: $BlobName [$SizeFormatted] — Archive -> $TargetTier ($RehydratePriority)" "SUCCESS" $ContainerProgress
 
-                    $CsvRows += [PSCustomObject]@{
+                    $CsvRows.Add([PSCustomObject]@{
                         Container          = $Container
                         BlobName           = $BlobName
                         SizeBytes          = $BlobSize
@@ -607,13 +566,13 @@ try {
                         Status             = "RehydrateInitiated"
                         RehydrationStatus  = "rehydrate-pending-to-$($TargetTier.ToLower())"
                         LastModified       = $LastModified
-                    }
+                    })
                 } else {
                     $RehydrateFailed++
                     $HasFailures = $true
                     Write-Log "  FAILED: $BlobName [$SizeFormatted] — $($SetTierResult.ErrorDetail)" "ERROR" $ContainerProgress
 
-                    $CsvRows += [PSCustomObject]@{
+                    $CsvRows.Add([PSCustomObject]@{
                         Container          = $Container
                         BlobName           = $BlobName
                         SizeBytes          = $BlobSize
@@ -623,57 +582,15 @@ try {
                         Status             = "Failed"
                         RehydrationStatus  = $SetTierResult.ErrorDetail
                         LastModified       = $LastModified
-                    }
+                    })
                 }
             }
 
-            # Check for continuation marker (pagination)
-            # Azure CLI returns a nextMarker in the raw output for blob list
-            # For simplicity and reliability, if we got a full batch, attempt next page
-            if ($Blobs.Count -lt 5000) {
-                $Marker = $null
-            } else {
-                # Retrieve the raw output with nextMarker for pagination
-                if ($AccountInfo.isHnsEnabled -eq $true) {
-                    $MarkerArgs = @(
-                        "storage", "fs", "file", "list",
-                        "--file-system", $Container,
-                        "--account-name", $StorageAccountName,
-                        "--account-key", $AccountKey,
-                        "--num-results", "5000",
-                        "--query", "nextMarker",
-                        "-o", "tsv"
-                    )
-                } else {
-                    $MarkerArgs = @(
-                        "storage", "blob", "list",
-                        "--container-name", $Container,
-                        "--account-name", $StorageAccountName,
-                        "--account-key", $AccountKey,
-                        "--num-results", "5000",
-                        "--show-next-marker",
-                        "--query", "nextMarker",
-                        "-o", "tsv"
-                    )
-                }
-
-                if ($Marker) {
-                    $MarkerArgs += "--marker"
-                    $MarkerArgs += $Marker
-                }
-
-                $MarkerResult = Invoke-AzCommand -Arguments $MarkerArgs -IgnoreExitCode
-
-                if ($MarkerResult.Success -and $MarkerResult.StdOut.Trim()) {
-                    $Marker = $MarkerResult.StdOut.Trim()
-                    Write-Log "  Page $PageNum complete ($ContainerBlobsScanned blobs so far, $ContainerArchiveCount Archive). Continuing..." "INFO" $ContainerProgress
-                } else {
-                    $Marker = $null
-                }
-            }
+            # Marker is already extracted from the response above — no second API call needed
 
         } while ($Marker)
 
+        Write-Progress -Activity "Scanning blobs" -Completed
         Write-Log "  Container '$Container' complete: $ContainerBlobsScanned blobs scanned, $ContainerArchiveCount Archive blobs found." "INFO" $ContainerProgress
     }
 
