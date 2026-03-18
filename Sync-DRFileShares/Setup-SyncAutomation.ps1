@@ -857,10 +857,15 @@ try {
 
     } else {
         # ── Option C: Auto-create a VM as Hybrid Worker ──
+        $MaxVMNameLength = if ($VMOsType -eq "Windows") { 15 } else { 64 }
         if ([string]::IsNullOrWhiteSpace($HybridWorkerVMName)) {
             $HybridWorkerVMName = "vm-hwk-$($AutomationAccountName.ToLower() -replace '[^a-z0-9]','')"
+            if ($HybridWorkerVMName.Length -gt $MaxVMNameLength) {
+                $HybridWorkerVMName = $HybridWorkerVMName.Substring(0, $MaxVMNameLength)
+            }
+        } elseif ($HybridWorkerVMName.Length -gt $MaxVMNameLength) {
+            throw "VM name '$HybridWorkerVMName' exceeds the maximum length of $MaxVMNameLength characters for $VMOsType VMs."
         }
-        if ($HybridWorkerVMName.Length -gt 15) { $HybridWorkerVMName = $HybridWorkerVMName.Substring(0, 15) }
 
         $EffectiveWorkerGroup = "hwg-sync-dr-fileshares"
         $AASubId = $CurrentAccount.id
@@ -1070,8 +1075,7 @@ try {
         $RunbookBody = @{
             location = $Location
             properties = @{
-                runbookType = "PowerShell"
-                runtimeEnvironment = "PowerShell-7.2"
+                runbookType = "PowerShell7"
                 description = "Syncs Azure File Shares from source to destination using AzCopy (Managed Identity auth)."
             }
         } | ConvertTo-Json -Depth 5
