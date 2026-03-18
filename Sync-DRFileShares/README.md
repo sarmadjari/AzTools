@@ -2,7 +2,7 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
-**Author:** Sarmad Jari | **Version:** 2.1 | **Date:** 2026-03-12
+**Author:** Sarmad Jari | **Version:** 2.2 | **Date:** 2026-03-19
 
 Syncs Azure File Shares from source to destination storage accounts using `azcopy sync`. Compares source vs destination and transfers only changed files — much faster on subsequent runs than `azcopy copy`. Supports Additive (default, no deletes) and Mirror (syncs deletions) modes. Optimized for large file shares: SMB permissions are opt-in (`-PreserveSmbPermissions`), AzCopy uses `--log-level=ERROR` to reduce I/O, and partial syncs (AzCopy exit code 1) are tracked separately from total failures.
 
@@ -130,7 +130,7 @@ All parameters are optional. In Automation mode, values fall back to Automation 
 Use `Setup-SyncAutomation.ps1` to deploy everything in one command:
 
 ```powershell
-# Simplest — auto-creates a VM as Hybrid Worker
+# Simplest — auto-creates a VM (name derived from AutomationAccountName + "-vm")
 ./Setup-SyncAutomation.ps1 `
     -AutomationAccountName "aa-dr-sync" `
     -ResourceGroupName "rg-automation" `
@@ -145,6 +145,15 @@ Use `Setup-SyncAutomation.ps1` to deploy everything in one command:
     -Location "switzerlandnorth" `
     -CsvPath "./resources.csv" `
     -HybridWorkerVMName "vm-mycustomname" `
+    -ScheduleIntervalHours 4
+
+# Skip NAT Gateway (use when the subnet already has outbound internet access)
+./Setup-SyncAutomation.ps1 `
+    -AutomationAccountName "aa-dr-sync" `
+    -ResourceGroupName "rg-automation" `
+    -Location "switzerlandnorth" `
+    -CsvPath "./resources.csv" `
+    -SkipNatGateway `
     -ScheduleIntervalHours 4
 ```
 
@@ -162,17 +171,56 @@ If you already have a VM, pass its Resource ID instead:
 
 This creates and configures:
 
-| Resource | Details |
-|---|---|
-| Automation Account | Hosts the Runbook, schedule, and variables |
-| VM (auto-created if needed) | Small Linux VM (Standard_B2s). Name is auto-generated based on the Automation Account name but can be overridden with `-HybridWorkerVMName`. Size/OS can be overridden with `-VMSize` / `-VMOsType`. |
-| System-Assigned Managed Identity | Secure auth — no credentials stored |
-| Hybrid Runbook Worker | VM-based execution (azcopy requires a real host, not a cloud sandbox) |
-| Recurring schedule | Configurable interval (default: every 6 hours) |
-| Automation Variables | `SyncCSVContent` (encrypted), `SyncMode`, `DestSubscriptionId`, `PreserveSmbPermissions`, `ExcludePattern` |
-| RBAC | Storage Account Contributor on all source and destination resource groups |
+| Resource | Naming Convention | Details |
+|---|---|---|
+| Automation Account | `{AutomationAccountName}` | Hosts the Runbook, schedule, and variables |
+| VM (auto-created if needed) | `{AutomationAccountName}-vm` or `{HybridWorkerVMName}` | Small Linux VM (Standard_B2s). Size/OS can be overridden with `-VMSize` / `-VMOsType` |
+| OS Disk | `{vmname}-osdisk` | Managed disk for the VM |
+| NIC | `{vmname}-nic` | Network interface attached to the VM |
+| VNET / Subnet | `{vmname}-vnet` / `default` | Virtual network and subnet for the VM |
+| NSG | `{vmname}-nsg` | Network security group for the VM |
+| NAT Gateway | `{vmname}-natgw` | Provides outbound internet access (skip with `-SkipNatGateway`) |
+| Public IP | `{vmname}-natgw-pip` | Standard SKU static IP for the NAT Gateway |
+| Runtime Environment | `PowerShell-7.4` | PowerShell 7.4 runtime with Az 12.3.0 modules |
+| System-Assigned Managed Identity | — | Secure auth — no credentials stored (on both AA and VM) |
+| Hybrid Worker Group | `hwg-sync-dr-fileshares` | Extension-based Hybrid Worker (VM registered automatically) |
+| Recurring schedule | `SyncDRFileShares-Every{N}h` | Configurable interval (default: every 12 hours) |
+| Automation Variables | — | `SyncCSVContent` (encrypted), `SyncMode`, `DestSubscriptionId`, `PreserveSmbPermissions`, `ExcludePattern` |
+| RBAC | — | Storage Account Contributor on all source and destination resource groups |
 
-Prerequisites (Azure CLI, AzCopy, PowerShell 7) are automatically installed on the VM. For existing Hybrid Worker Groups (`-HybridWorkerGroup`), ensure the VM has these tools pre-installed.
+Prerequisites (Azure CLI, AzCopy, PowerShell 7) are automatically installed on the VM. The script waits for the VM guest agent to become ready before running prerequisite checks.
+
+#### Setup-SyncAutomation.ps1 Parameters
+
+| Parameter | Required | Default | Description |
+|---|---|---|---|
+| `-AutomationAccountName` | Yes | — | Name of the Automation Account to create or reuse |
+| `-ResourceGroupName` | Yes | — | Resource group for the Automation Account |
+| `-Location` | Yes | — | Azure region (e.g., `switzerlandnorth`) |
+| `-CsvPath` | Yes | — | Path to the CSV mapping file |
+| `-HybridWorkerVMResourceId` | No | — | ARM Resource ID of an existing VM. When provided, skips VM creation |
+| `-HybridWorkerVMName` | No | `{AutomationAccountName}-vm` | Custom name for the auto-created VM. Cannot be used with `-HybridWorkerVMResourceId` |
+| `-VMSize` | No | `Standard_B2s` | VM size for auto-created VM |
+| `-VMOsType` | No | `Linux` | `Linux` or `Windows` for auto-created VM |
+| `-DestSubscriptionId` | No | Source subscription | Subscription for destination storage accounts |
+| `-ScheduleIntervalHours` | No | `12` | Sync frequency in hours (1-24) |
+| `-SyncMode` | No | `Additive` | `Additive` or `Mirror` |
+| `-PreserveSmbPermissions` | No | Off | Preserves NTFS ACLs during sync |
+| `-ExcludePattern` | No | — | Semicolon-delimited glob pattern to skip files |
+| `-SkipNatGateway` | No | Off | Skips NAT Gateway creation. Use when the subnet already has outbound access (existing NAT Gateway, Azure Firewall, or UDR) |
+| `-DryRun` | No | Off | Preview changes without creating anything |
+
+#### Outbound Internet Access (NAT Gateway)
+
+The auto-created VM requires outbound internet access to reach:
+
+- `*.file.core.windows.net` — Azure Storage data plane (AzCopy sync)
+- `management.azure.com` — ARM API (SAS token generation, firewall toggling)
+- Package repositories — for prerequisite installation (Azure CLI, AzCopy, PowerShell 7)
+
+By default, the script creates a **NAT Gateway** with a Standard SKU static Public IP and associates it with the VM's subnet. This is required because Azure's default outbound access (SNAT) is deprecated for VMs created after November 2025.
+
+Use `-SkipNatGateway` if your environment already provides outbound connectivity (e.g., existing NAT Gateway, Azure Firewall with UDR, or ExpressRoute with forced tunneling).
 
 To change the sync frequency, re-run `Setup-SyncAutomation.ps1` with a different `-ScheduleIntervalHours` value.
 
@@ -188,7 +236,7 @@ When you add or remove storage accounts from the CSV after the Automation Accoun
     -ResourceGroupName "rg-automation" `
     -Location "switzerlandnorth" `
     -CsvPath "./resources-updated.csv" `
-    -HybridWorkerGroup "my-worker-group"
+    -HybridWorkerVMResourceId "/subscriptions/.../virtualMachines/vm-hybrid-worker"
 ```
 
 The script is idempotent — it skips everything that already exists (Automation Account, VM, schedule, RBAC) and only overwrites the `SyncCSVContent` variable with the new CSV content. If the updated CSV references **new resource groups**, the script also assigns the required RBAC (`Storage Account Contributor`) on those new scopes automatically.

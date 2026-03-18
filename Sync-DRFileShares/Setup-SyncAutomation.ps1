@@ -88,6 +88,12 @@
     The Runbook passes this to AzCopy --exclude-pattern to skip matching files during
     sync. Example: "*.tmp;~$*;thumbs.db"
 
+.PARAMETER SkipNatGateway
+    Switch. Skips NAT Gateway and Public IP creation for the auto-created VM.
+    Use when the VM subnet already has outbound internet access (e.g., existing
+    NAT Gateway, Azure Firewall, or UDR). Without outbound access the VM cannot
+    reach Azure Storage endpoints or management APIs.
+
 .PARAMETER DryRun
     Switch. Dry run — shows what would be created without making changes.
 
@@ -191,6 +197,7 @@ param (
     [Parameter(Mandatory=$false)][ValidateSet("Additive","Mirror")][string]$SyncMode = "Additive",
     [switch]$PreserveSmbPermissions,
     [string]$ExcludePattern,
+    [switch]$SkipNatGateway,
     [switch]$DryRun
 )
 
@@ -846,15 +853,22 @@ try {
         Write-Log "Creating Hybrid Worker VM '$HybridWorkerVMName' ($VMOsType, $VMSize)..."
 
         if ($DryRun) {
-            $DryRunOsDiskName = "$HybridWorkerVMName-osdisk"
-            $DryRunNicName    = "$HybridWorkerVMName-nic"
-            $DryRunVNetName   = "$HybridWorkerVMName-vnet"
-            $DryRunNSGName    = "$HybridWorkerVMName-nsg"
+            $DryRunOsDiskName  = "$HybridWorkerVMName-osdisk"
+            $DryRunNicName     = "$HybridWorkerVMName-nic"
+            $DryRunVNetName    = "$HybridWorkerVMName-vnet"
+            $DryRunNSGName     = "$HybridWorkerVMName-nsg"
             Write-Log "  [DRYRUN] Would create VM '$HybridWorkerVMName' (size: $VMSize, os: $VMOsType) in '$ResourceGroupName'" "DRYRUN"
-            Write-Log "  [DRYRUN]   OS Disk : $DryRunOsDiskName" "DRYRUN"
-            Write-Log "  [DRYRUN]   NIC     : $DryRunNicName" "DRYRUN"
-            Write-Log "  [DRYRUN]   VNET    : $DryRunVNetName" "DRYRUN"
-            Write-Log "  [DRYRUN]   NSG     : $DryRunNSGName" "DRYRUN"
+            Write-Log "  [DRYRUN]   OS Disk    : $DryRunOsDiskName" "DRYRUN"
+            Write-Log "  [DRYRUN]   NIC        : $DryRunNicName" "DRYRUN"
+            Write-Log "  [DRYRUN]   VNET       : $DryRunVNetName" "DRYRUN"
+            Write-Log "  [DRYRUN]   NSG        : $DryRunNSGName" "DRYRUN"
+            if (-not $SkipNatGateway) {
+                $DryRunNatGwName = "$HybridWorkerVMName-natgw"
+                $DryRunNatGwPip  = "$HybridWorkerVMName-natgw-pip"
+                Write-Log "  [DRYRUN]   NAT Gateway: $DryRunNatGwName (Public IP: $DryRunNatGwPip)" "DRYRUN"
+            } else {
+                Write-Log "  [DRYRUN]   NAT Gateway: Skipped (-SkipNatGateway)" "DRYRUN"
+            }
             Write-Log "  [DRYRUN] Would enable System-Assigned MI on VM '$HybridWorkerVMName'" "DRYRUN"
             Write-Log "  [DRYRUN] Would check and install prerequisites (az cli, azcopy, pwsh) on VM" "DRYRUN"
             Write-Log "  [DRYRUN] Would create Hybrid Worker Group '$EffectiveWorkerGroup'" "DRYRUN"
@@ -875,11 +889,13 @@ try {
                 $Image = if ($VMOsType -eq "Linux") { "Ubuntu2204" } else { "Win2022Datacenter" }
 
                 # Derive clean names for all VM-related resources
-                $OsDiskName = "$HybridWorkerVMName-osdisk"
-                $NicName    = "$HybridWorkerVMName-nic"
-                $VNetName   = "$HybridWorkerVMName-vnet"
-                $NSGName    = "$HybridWorkerVMName-nsg"
-                $SubnetName = "default"
+                $OsDiskName  = "$HybridWorkerVMName-osdisk"
+                $NicName     = "$HybridWorkerVMName-nic"
+                $VNetName    = "$HybridWorkerVMName-vnet"
+                $NSGName     = "$HybridWorkerVMName-nsg"
+                $NatGwName   = "$HybridWorkerVMName-natgw"
+                $NatGwPipName = "$HybridWorkerVMName-natgw-pip"
+                $SubnetName  = "default"
 
                 Write-Log "  Creating networking resources for VM '$HybridWorkerVMName'..."
 
@@ -908,6 +924,53 @@ try {
                 ) -IgnoreExitCode
                 if ($VNetCreate.ExitCode -ne 0) {
                     Write-Log "    VNET may already exist, continuing..." "WARN"
+                }
+
+                # Create NAT Gateway for outbound internet access (unless skipped)
+                if (-not $SkipNatGateway) {
+                    Write-Log "    Creating Public IP '$NatGwPipName' for NAT Gateway..."
+                    $NatPipCreate = Invoke-AzCommand -Arguments @(
+                        "network", "public-ip", "create",
+                        "--name", $NatGwPipName,
+                        "--resource-group", $ResourceGroupName,
+                        "--location", $Location,
+                        "--sku", "Standard",
+                        "--allocation-method", "Static",
+                        "-o", "none"
+                    ) -IgnoreExitCode
+                    if ($NatPipCreate.ExitCode -ne 0) {
+                        Write-Log "    Public IP may already exist, continuing..." "WARN"
+                    }
+
+                    Write-Log "    Creating NAT Gateway '$NatGwName'..."
+                    $NatGwCreate = Invoke-AzCommand -Arguments @(
+                        "network", "nat", "gateway", "create",
+                        "--name", $NatGwName,
+                        "--resource-group", $ResourceGroupName,
+                        "--location", $Location,
+                        "--public-ip-addresses", $NatGwPipName,
+                        "--idle-timeout", "4",
+                        "-o", "none"
+                    ) -IgnoreExitCode
+                    if ($NatGwCreate.ExitCode -ne 0) {
+                        Write-Log "    NAT Gateway may already exist, continuing..." "WARN"
+                    }
+
+                    # Associate NAT Gateway with subnet
+                    Write-Log "    Associating NAT Gateway with subnet '$SubnetName'..."
+                    $NatAssoc = Invoke-AzCommand -Arguments @(
+                        "network", "vnet", "subnet", "update",
+                        "--name", $SubnetName,
+                        "--resource-group", $ResourceGroupName,
+                        "--vnet-name", $VNetName,
+                        "--nat-gateway", $NatGwName,
+                        "-o", "none"
+                    ) -IgnoreExitCode
+                    if ($NatAssoc.ExitCode -ne 0) {
+                        Write-Log "    WARNING: Failed to associate NAT Gateway with subnet. VM may lack outbound internet access." "WARN"
+                    }
+                } else {
+                    Write-Log "    Skipping NAT Gateway creation (-SkipNatGateway). Ensure the VM has outbound internet access." "WARN"
                 }
 
                 # Create NIC attached to subnet and NSG
@@ -1110,7 +1173,7 @@ try {
 
         # Wait for Runtime Environment to provision
         Write-Log "  Waiting for Runtime Environment to provision (may take 2-5 minutes)..."
-        $MaxWaitSeconds = 300
+        $MaxWaitSeconds = 600
         $ElapsedSeconds = 0
         $RTEReady = $false
 
