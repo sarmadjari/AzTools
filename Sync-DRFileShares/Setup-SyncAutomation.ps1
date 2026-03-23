@@ -1258,7 +1258,7 @@ try {
         $RunbookBody = @{
             location = $Location
             properties = @{
-                runbookType        = "PowerShell7"
+                runbookType        = "PowerShell"
                 runtimeEnvironment = $RuntimeEnvName
                 description        = "Syncs Azure File Shares from source to destination using AzCopy (Managed Identity auth)."
             }
