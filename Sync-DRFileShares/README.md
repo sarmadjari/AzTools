@@ -2,7 +2,7 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
-**Author:** Sarmad Jari | **Version:** 2.2 | **Date:** 2026-03-19
+**Author:** Sarmad Jari | **Version:** 2.3 | **Date:** 2026-03-23
 
 Syncs Azure File Shares from source to destination storage accounts using `azcopy sync`. Compares source vs destination and transfers only changed files — much faster on subsequent runs than `azcopy copy`. Supports Additive (default, no deletes) and Mirror (syncs deletions) modes. Optimized for large file shares: SMB permissions are opt-in (`-PreserveSmbPermissions`), AzCopy uses `--log-level=ERROR` to reduce I/O, and partial syncs (AzCopy exit code 1) are tracked separately from total failures.
 
@@ -239,7 +239,7 @@ When you add or remove storage accounts from the CSV after the Automation Accoun
     -HybridWorkerVMResourceId "/subscriptions/.../virtualMachines/vm-hybrid-worker"
 ```
 
-The script is idempotent — it skips everything that already exists (Automation Account, VM, schedule, RBAC) and only overwrites the `SyncCSVContent` variable with the new CSV content. If the updated CSV references **new resource groups**, the script also assigns the required RBAC (`Storage Account Contributor`) on those new scopes automatically.
+The script is idempotent — it skips everything that already exists (Automation Account, VM, schedule) and only overwrites the `SyncCSVContent` variable with the new CSV content. RBAC assignments are checked in bulk (one API call per principal) and only new assignments are created — existing ones are skipped. If the updated CSV references **new resource groups**, the script assigns the required RBAC (`Storage Account Contributor`) on those new scopes automatically.
 
 **Option 2 — Update only the variable (quick, no RBAC)**
 
@@ -327,6 +327,7 @@ The script is designed for repeated execution:
 - **Firewalls** are always restored, even on error
 - **SAS tokens** are cleaned up in every code path
 - **New shares auto-created** — if a share exists on source but not on destination, it is created automatically with matching quota and access tier before syncing
+- **RBAC assignments** (`Setup-SyncAutomation.ps1`) — existing assignments are detected in bulk (one API call per principal) and skipped. Only new scopes trigger assignment creation
 
 ## Output
 
@@ -365,6 +366,9 @@ Output goes to the Azure Automation job log (plain text). No results CSV is expo
 | `No CSV source specified` | Neither `-CsvPath` provided nor running in Automation | Provide `-CsvPath` for manual runs, or deploy via `Setup-SyncAutomation.ps1` for automation |
 | `SyncCSVContent is empty` | Automation Variable not configured | Re-run `Setup-SyncAutomation.ps1` to populate the variable |
 | `Failed to authenticate via Managed Identity` | MI not enabled or missing RBAC | Ensure the Automation Account has a System-Assigned MI with Storage Account Contributor role |
+| `AZURE POLICY VIOLATION: Require a tag on resource groups` | Azure Policy requires tags (e.g., cost centre) on resource groups | Create the resource group manually with the required tags before running `Setup-SyncAutomation.ps1`. The script will reuse the existing RG |
+| `Runtime Environment provisioning did not complete within 600s` | Azure is slow to provision Az modules into the Runtime Environment | This is a warning, not a failure. The provisioning continues in the background. Check the Automation Account in the portal — the Runtime Environment will show as "Succeeded" after a few more minutes |
+| `No output from prerequisite check` | VM guest agent not ready when prerequisites were checked | The VM was just created and the OS was still initialising. Verify tools manually: SSH into the VM and run `az --version`, `azcopy --version`, `pwsh --version` |
 
 ## Workflow
 

@@ -119,8 +119,8 @@
 
 .NOTES
     Author  : Sarmad Jari
-    Version : 1.2
-    Date    : 2026-03-19
+    Version : 1.3
+    Date    : 2026-03-23
     License : MIT License (https://opensource.org/licenses/MIT)
 
     DISCLAIMER
