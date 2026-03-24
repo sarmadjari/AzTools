@@ -561,18 +561,83 @@ function Register-HybridWorker {
         "-o", "none"
     ) -IgnoreExitCode
 
-    # Register VM as Hybrid Worker
-    Write-Log "  Registering VM '$HybridWorkerVMName' as Hybrid Worker..."
+    # Register VM as Hybrid Worker (--name requires a GUID, not the VM name)
+    $WorkerId = [guid]::NewGuid().ToString()
+    Write-Log "  Registering VM '$HybridWorkerVMName' as Hybrid Worker (ID: $WorkerId)..."
     $HWCreate = Invoke-AzCommand -Arguments @(
         "automation", "hrwg", "hrw", "create",
         "--automation-account-name", $AutomationAccountName,
         "--resource-group", $AAResourceGroup,
         "--hybrid-runbook-worker-group-name", $WorkerGroupName,
-        "--name", $HybridWorkerVMName,
+        "--name", $WorkerId,
         "--vm-resource-id", $Result.VMResourceId,
         "-o", "none"
     ) -IgnoreExitCode
     Write-Log "  Hybrid Worker registered." "SUCCESS"
+
+    # Install the Hybrid Worker extension on the VM so it can heartbeat and run jobs
+    $AutomationAccountURL = ($AACheckResult.StdOut | ConvertFrom-Json).automationHybridServiceUrl
+    if (-not $AutomationAccountURL) {
+        Write-Log "  WARNING: Could not retrieve automationHybridServiceUrl. Hybrid Worker extension not installed." "WARN"
+        Write-Log "  Install the extension manually — see troubleshooting docs." "WARN"
+    } else {
+        $ExtensionName = if ($DetectedOsType -eq "Linux") { "HybridWorkerForLinux" } else { "HybridWorkerExtension" }
+        $ExtensionSettings = "{`"AutomationAccountURL`":`"$AutomationAccountURL`"}"
+
+        Write-Log "  Installing Hybrid Worker extension '$ExtensionName' on VM '$HybridWorkerVMName'..."
+        $ExtResult = Invoke-AzCommand -Arguments @(
+            "vm", "extension", "set",
+            "--vm-name", $HybridWorkerVMName,
+            "--resource-group", $VMResourceGroup,
+            "--name", $ExtensionName,
+            "--publisher", "Microsoft.Azure.Automation.HybridWorker",
+            "--settings", $ExtensionSettings,
+            "--enable-auto-upgrade", "true",
+            "-o", "none"
+        ) -IgnoreExitCode
+
+        if ($ExtResult.ExitCode -eq 0) {
+            Write-Log "  Hybrid Worker extension installed." "SUCCESS"
+        } else {
+            Write-Log "  WARNING: Hybrid Worker extension installation may have failed: $($ExtResult.ErrorDetail)" "WARN"
+            Write-Log "  Install the extension manually if the worker does not heartbeat." "WARN"
+        }
+
+        # Wait for the worker to heartbeat (up to 120 seconds)
+        Write-Log "  Waiting for Hybrid Worker to heartbeat..."
+        $HWReady = $false
+        $HWElapsed = 0
+        $HWMaxWait = 120
+
+        while ($HWElapsed -lt $HWMaxWait) {
+            Start-Sleep -Seconds 15
+            $HWElapsed += 15
+
+            $HWCheck = Invoke-AzCommand -Arguments @(
+                "automation", "hrwg", "hrw", "show",
+                "--automation-account-name", $AutomationAccountName,
+                "--resource-group", $AAResourceGroup,
+                "--hybrid-runbook-worker-group-name", $WorkerGroupName,
+                "--name", $WorkerId,
+                "-o", "json"
+            ) -IgnoreExitCode
+
+            if ($HWCheck.ExitCode -eq 0 -and $HWCheck.StdOut) {
+                $LastSeen = ($HWCheck.StdOut | ConvertFrom-Json).lastSeenDateTime
+                if ($LastSeen -and $LastSeen -ne "0001-01-01T00:00:00+00:00") {
+                    Write-Log "  Hybrid Worker heartbeat detected (last seen: $LastSeen)." "SUCCESS"
+                    $HWReady = $true
+                    break
+                }
+            }
+            Write-Log "  Waiting for heartbeat (${HWElapsed}s elapsed)..."
+        }
+
+        if (-not $HWReady) {
+            Write-Log "  WARNING: Hybrid Worker did not heartbeat within ${HWMaxWait}s. It may still be initializing." "WARN"
+            Write-Log "  Check the Hybrid Worker Group in the portal after a few minutes." "WARN"
+        }
+    }
 
     return $Result
 }
@@ -823,7 +888,9 @@ try {
             Write-Log "  [DRYRUN] Would enable System-Assigned MI on VM '$HybridWorkerVMName'" "DRYRUN"
             Write-Log "  [DRYRUN] Would check and install prerequisites (az cli, azcopy, pwsh) on VM '$HybridWorkerVMName'" "DRYRUN"
             Write-Log "  [DRYRUN] Would create Hybrid Worker Group '$EffectiveWorkerGroup'" "DRYRUN"
-            Write-Log "  [DRYRUN] Would register VM as Hybrid Worker" "DRYRUN"
+            Write-Log "  [DRYRUN] Would register VM as Hybrid Worker (with GUID)" "DRYRUN"
+            Write-Log "  [DRYRUN] Would install Hybrid Worker extension on VM" "DRYRUN"
+            Write-Log "  [DRYRUN] Would wait for Hybrid Worker heartbeat" "DRYRUN"
         } else {
             $HWResult = Register-HybridWorker `
                 -HybridWorkerVMName $HybridWorkerVMName `
@@ -872,7 +939,9 @@ try {
             Write-Log "  [DRYRUN] Would enable System-Assigned MI on VM '$HybridWorkerVMName'" "DRYRUN"
             Write-Log "  [DRYRUN] Would check and install prerequisites (az cli, azcopy, pwsh) on VM" "DRYRUN"
             Write-Log "  [DRYRUN] Would create Hybrid Worker Group '$EffectiveWorkerGroup'" "DRYRUN"
-            Write-Log "  [DRYRUN] Would register VM as Hybrid Worker" "DRYRUN"
+            Write-Log "  [DRYRUN] Would register VM as Hybrid Worker (with GUID)" "DRYRUN"
+            Write-Log "  [DRYRUN] Would install Hybrid Worker extension on VM" "DRYRUN"
+            Write-Log "  [DRYRUN] Would wait for Hybrid Worker heartbeat" "DRYRUN"
         } else {
             # Check if VM already exists (idempotent re-runs)
             $VMCheck = Invoke-AzCommand -Arguments @(

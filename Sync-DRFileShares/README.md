@@ -2,7 +2,7 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
-**Author:** Sarmad Jari | **Version:** 2.3 | **Date:** 2026-03-23
+**Author:** Sarmad Jari | **Version:** 2.4 | **Date:** 2026-03-24
 
 Syncs Azure File Shares from source to destination storage accounts using `azcopy sync`. Compares source vs destination and transfers only changed files — much faster on subsequent runs than `azcopy copy`. Supports Additive (default, no deletes) and Mirror (syncs deletions) modes. Optimized for large file shares: SMB permissions are opt-in (`-PreserveSmbPermissions`), AzCopy uses `--log-level=ERROR` to reduce I/O, and partial syncs (AzCopy exit code 1) are tracked separately from total failures.
 
@@ -125,41 +125,147 @@ All parameters are optional. In Automation mode, values fall back to Automation 
 ./Sync-DRFileShares.ps1 -CsvPath "./resources.csv" -PreserveSmbPermissions -ExcludePattern "*.tmp;~$*"
 ```
 
-### Automated Sync (Azure Automation + Hybrid Worker)
+### Automated Sync
 
-Use `Setup-SyncAutomation.ps1` to deploy everything in one command:
+Two automation approaches are available:
+
+| Approach | Script | Complexity | Best For |
+|---|---|---|---|
+| **VM + Cron** (recommended) | `Setup-SyncVM.ps1` | Simple | Most deployments — fewer moving parts, easier to troubleshoot |
+| **Automation Account + Hybrid Worker** | `Setup-SyncAutomation.ps1` | Complex | When you need Azure Automation features (centralized job history, portal integration, webhooks) |
+
+---
+
+### Option A: VM + Cron (Setup-SyncVM.ps1) — Recommended
+
+Deploys the sync script directly to a Linux VM with a cron job. No Automation Account, no Hybrid Worker, no Runtime Environment — just a VM with Managed Identity.
 
 ```powershell
-# Simplest — auto-creates a VM (name derived from AutomationAccountName + "-vm")
-./Setup-SyncAutomation.ps1 `
-    -AutomationAccountName "aa-dr-sync" `
-    -ResourceGroupName "rg-automation" `
+# Create a new VM and set up sync every 12 hours
+./Setup-SyncVM.ps1 `
+    -ResourceGroupName "rg-dr-sync" `
     -Location "switzerlandnorth" `
     -CsvPath "./resources.csv" `
-    -ScheduleIntervalHours 4
+    -VMName "vm-dr-sync"
 
-# Auto-creates a VM with a custom name
-./Setup-SyncAutomation.ps1 `
-    -AutomationAccountName "aa-dr-sync" `
-    -ResourceGroupName "rg-automation" `
+# Use an existing VM
+./Setup-SyncVM.ps1 `
+    -ResourceGroupName "rg-dr-sync" `
     -Location "switzerlandnorth" `
     -CsvPath "./resources.csv" `
-    -HybridWorkerVMName "vm-mycustomname" `
-    -ScheduleIntervalHours 4
+    -VMResourceId "/subscriptions/.../virtualMachines/vm-existing"
 
-# Skip NAT Gateway (use when the subnet already has outbound internet access)
-./Setup-SyncAutomation.ps1 `
-    -AutomationAccountName "aa-dr-sync" `
-    -ResourceGroupName "rg-automation" `
+# Custom interval, Mirror mode, cross-subscription
+./Setup-SyncVM.ps1 `
+    -ResourceGroupName "rg-dr-sync" `
     -Location "switzerlandnorth" `
     -CsvPath "./resources.csv" `
-    -SkipNatGateway `
-    -ScheduleIntervalHours 4
+    -VMName "vm-dr-sync" `
+    -ScheduleIntervalHours 4 `
+    -SyncMode Mirror `
+    -DestSubscriptionId "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
+
+# Dry run — preview what would be created
+./Setup-SyncVM.ps1 `
+    -ResourceGroupName "rg-dr-sync" `
+    -Location "switzerlandnorth" `
+    -CsvPath "./resources.csv" `
+    -VMName "vm-dr-sync" `
+    -DryRun
 ```
 
-If you already have a VM, pass its Resource ID instead:
+This creates and configures:
+
+| Resource | Details |
+|---|---|
+| VM (auto-created if needed) | Linux Ubuntu 22.04 (Standard_B2s by default) |
+| NSG, VNET, NAT Gateway | Networking for the VM (NAT GW skippable with `-SkipNatGateway`) |
+| System-Assigned Managed Identity | Secure auth — no credentials stored |
+| Prerequisites | Azure CLI, AzCopy, PowerShell 7 (auto-installed) |
+| RBAC | Storage Account Contributor on all source/destination resource groups |
+| `/opt/dr-sync/` | Sync script, CSV, config, and wrapper script deployed to the VM |
+| Cron job (`/etc/cron.d/dr-sync`) | Recurring schedule (default: every 12 hours) |
+| Log rotation (`/etc/logrotate.d/dr-sync`) | 14 days retention, compressed |
+
+**Files on the VM:**
+
+```
+/opt/dr-sync/
+├── Sync-DRFileShares.ps1    # sync script
+├── resources.csv             # CSV mapping
+├── run-sync.sh              # wrapper (cron entry point)
+└── config.env               # sync parameters
+
+/var/log/dr-sync/
+├── sync-YYYYMMDD-HHMMSS.log # per-run logs
+├── latest.log →              # symlink to latest
+└── cron.log                  # cron stderr
+```
+
+**Manual trigger:**
+
+```bash
+az vm run-command invoke --name vm-dr-sync --resource-group rg-dr-sync \
+    --command-id RunShellScript --scripts "/opt/dr-sync/run-sync.sh"
+```
+
+**Check logs:**
+
+```bash
+az vm run-command invoke --name vm-dr-sync --resource-group rg-dr-sync \
+    --command-id RunShellScript --scripts "cat /var/log/dr-sync/latest.log"
+```
+
+#### Setup-SyncVM.ps1 Parameters
+
+| Parameter | Required | Default | Description |
+|---|---|---|---|
+| `-ResourceGroupName` | Yes | — | Resource group for the VM |
+| `-Location` | Yes | — | Azure region (e.g., `switzerlandnorth`) |
+| `-CsvPath` | Yes | — | Path to the CSV mapping file |
+| `-VMResourceId` | No* | — | ARM Resource ID of an existing Linux VM |
+| `-VMName` | No* | — | Name for a new VM to create |
+| `-VMSize` | No | `Standard_B2s` | VM size for the new VM |
+| `-DestSubscriptionId` | No | Source subscription | Subscription for destination storage accounts |
+| `-ScheduleIntervalHours` | No | `12` | Sync frequency in hours (1-24) |
+| `-SyncMode` | No | `Additive` | `Additive` or `Mirror` |
+| `-PreserveSmbPermissions` | No | Off | Preserves NTFS ACLs during sync |
+| `-ExcludePattern` | No | — | Semicolon-delimited glob pattern to skip files |
+| `-SkipNatGateway` | No | Off | Skips NAT Gateway creation |
+| `-DryRun` | No | Off | Preview changes without creating anything |
+
+*Must specify exactly one of `-VMResourceId` or `-VMName`.
+
+#### Updating the CSV (VM + Cron)
+
+Re-run `Setup-SyncVM.ps1` with the updated CSV:
 
 ```powershell
+./Setup-SyncVM.ps1 `
+    -ResourceGroupName "rg-dr-sync" `
+    -Location "switzerlandnorth" `
+    -CsvPath "./resources-updated.csv" `
+    -VMResourceId "/subscriptions/.../virtualMachines/vm-dr-sync"
+```
+
+The script is idempotent — it overwrites the CSV and config on the VM, assigns RBAC for any new resource groups, and skips everything else.
+
+---
+
+### Option B: Azure Automation + Hybrid Worker (Setup-SyncAutomation.ps1)
+
+Use `Setup-SyncAutomation.ps1` to deploy via Azure Automation Account with a Hybrid Worker:
+
+```powershell
+# Auto-creates a VM as Hybrid Worker
+./Setup-SyncAutomation.ps1 `
+    -AutomationAccountName "aa-dr-sync" `
+    -ResourceGroupName "rg-automation" `
+    -Location "switzerlandnorth" `
+    -CsvPath "./resources.csv" `
+    -ScheduleIntervalHours 4
+
+# Use an existing VM as Hybrid Worker
 ./Setup-SyncAutomation.ps1 `
     -AutomationAccountName "aa-dr-sync" `
     -ResourceGroupName "rg-automation" `
@@ -210,23 +316,7 @@ Prerequisites (Azure CLI, AzCopy, PowerShell 7) are automatically installed on t
 | `-SkipNatGateway` | No | Off | Skips NAT Gateway creation. Use when the subnet already has outbound access (existing NAT Gateway, Azure Firewall, or UDR) |
 | `-DryRun` | No | Off | Preview changes without creating anything |
 
-#### Outbound Internet Access (NAT Gateway)
-
-The auto-created VM requires outbound internet access to reach:
-
-- `*.file.core.windows.net` — Azure Storage data plane (AzCopy sync)
-- `management.azure.com` — ARM API (SAS token generation, firewall toggling)
-- Package repositories — for prerequisite installation (Azure CLI, AzCopy, PowerShell 7)
-
-By default, the script creates a **NAT Gateway** with a Standard SKU static Public IP and associates it with the VM's subnet. This is required because Azure's default outbound access (SNAT) is deprecated for VMs created after November 2025.
-
-Use `-SkipNatGateway` if your environment already provides outbound connectivity (e.g., existing NAT Gateway, Azure Firewall with UDR, or ExpressRoute with forced tunneling).
-
-To change the sync frequency, re-run `Setup-SyncAutomation.ps1` with a different `-ScheduleIntervalHours` value.
-
-### Updating the CSV After Deployment
-
-When you add or remove storage accounts from the CSV after the Automation Account and Hybrid Worker are already deployed, you need to update the `SyncCSVContent` Automation Variable with the new CSV content. There are two ways:
+#### Updating the CSV (Automation Account)
 
 **Option 1 — Re-run Setup-SyncAutomation.ps1 (recommended)**
 
@@ -239,17 +329,25 @@ When you add or remove storage accounts from the CSV after the Automation Accoun
     -HybridWorkerVMResourceId "/subscriptions/.../virtualMachines/vm-hybrid-worker"
 ```
 
-The script is idempotent — it skips everything that already exists (Automation Account, VM, schedule) and only overwrites the `SyncCSVContent` variable with the new CSV content. RBAC assignments are checked in bulk (one API call per principal) and only new assignments are created — existing ones are skipped. If the updated CSV references **new resource groups**, the script assigns the required RBAC (`Storage Account Contributor`) on those new scopes automatically.
+The script is idempotent — it skips everything that already exists and only overwrites the `SyncCSVContent` variable with the new CSV content. RBAC assignments are checked in bulk and only new assignments are created.
 
 **Option 2 — Update only the variable (quick, no RBAC)**
 
-If you are only removing accounts, or the new accounts are in resource groups that already have RBAC, you can update just the variable directly:
-
 **Azure Portal → Automation Account → Variables → `SyncCSVContent` → Edit → paste the new CSV content → Save**
 
-> **Note:** If the new CSV references resource groups that were not in the original CSV, the Managed Identity will not have permissions on them and the sync will fail for those accounts. In that case, use Option 1.
+> **Note:** If the new CSV references resource groups that were not in the original CSV, the Managed Identity will not have permissions on them. Use Option 1 instead.
 
-The change takes effect immediately — the next scheduled Runbook execution reads `SyncCSVContent` fresh every time it runs. No restart or redeployment is needed.
+#### Outbound Internet Access (NAT Gateway)
+
+The auto-created VM requires outbound internet access to reach:
+
+- `*.file.core.windows.net` — Azure Storage data plane (AzCopy sync)
+- `management.azure.com` — ARM API (SAS token generation, firewall toggling)
+- Package repositories — for prerequisite installation (Azure CLI, AzCopy, PowerShell 7)
+
+By default, the script creates a **NAT Gateway** with a Standard SKU static Public IP and associates it with the VM's subnet. This is required because Azure's default outbound access (SNAT) is deprecated for VMs created after November 2025.
+
+Use `-SkipNatGateway` if your environment already provides outbound connectivity (e.g., existing NAT Gateway, Azure Firewall with UDR, or ExpressRoute with forced tunneling).
 
 ## Pre-Validation
 
@@ -377,8 +475,9 @@ Output goes to the Azure Automation job log (plain text). No results CSV is expo
 2. Dry run sync           ->  ./Sync-DRFileShares.ps1 -CsvPath "./resources.csv" -DryRun
 3. First sync             ->  ./Sync-DRFileShares.ps1 -CsvPath "./resources.csv"
 4. Review results CSV     ->  Check DRFileShareSyncResults_*.csv for errors
-5. Automate               ->  ./Setup-SyncAutomation.ps1 (deploys Automation + Hybrid Worker + schedule)
-6. (Optional) Mirror mode ->  Re-run Setup-SyncAutomation.ps1 with -SyncMode "Mirror"
+5. Automate (Option A)    ->  ./Setup-SyncVM.ps1 (VM + cron — recommended)
+   Automate (Option B)    ->  ./Setup-SyncAutomation.ps1 (Automation Account + Hybrid Worker)
+6. (Optional) Mirror mode ->  Re-run setup script with -SyncMode "Mirror"
 ```
 
 ## License
