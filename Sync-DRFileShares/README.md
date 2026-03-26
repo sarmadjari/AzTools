@@ -2,7 +2,7 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
-**Author:** Sarmad Jari | **Version:** 2.4 | **Date:** 2026-03-24
+**Author:** Sarmad Jari | **Version:** 2.5 | **Date:** 2026-03-25
 
 Syncs Azure File Shares from source to destination storage accounts using `azcopy sync`. Compares source vs destination and transfers only changed files — much faster on subsequent runs than `azcopy copy`. Supports Additive (default, no deletes) and Mirror (syncs deletions) modes. Optimized for large file shares: SMB permissions are opt-in (`-PreserveSmbPermissions`), AzCopy uses `--log-level=ERROR` to reduce I/O, and partial syncs (AzCopy exit code 1) are tracked separately from total failures.
 
@@ -165,6 +165,17 @@ Deploys the sync script directly to a Linux VM with a cron job. No Automation Ac
     -SyncMode Mirror `
     -DestSubscriptionId "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
 
+# Hub-Spoke: place VM in an existing VNet/Subnet (VNet in a different RG)
+./Setup-SyncVM.ps1 `
+    -ResourceGroupName "rg-dr-sync" `
+    -Location "switzerlandnorth" `
+    -CsvPath "./resources.csv" `
+    -VMName "vm-dr-sync" `
+    -ExistingVNetName "hub-vnet" `
+    -ExistingSubnetName "snet-sync" `
+    -ExistingVNetResourceGroup "rg-networking" `
+    -SkipNatGateway
+
 # Dry run — preview what would be created
 ./Setup-SyncVM.ps1 `
     -ResourceGroupName "rg-dr-sync" `
@@ -176,16 +187,21 @@ Deploys the sync script directly to a Linux VM with a cron job. No Automation Ac
 
 This creates and configures:
 
-| Resource | Details |
-|---|---|
-| VM (auto-created if needed) | Linux Ubuntu 22.04 (Standard_B2s by default) |
-| NSG, VNET, NAT Gateway | Networking for the VM (NAT GW skippable with `-SkipNatGateway`) |
-| System-Assigned Managed Identity | Secure auth — no credentials stored |
-| Prerequisites | Azure CLI, AzCopy, PowerShell 7 (auto-installed) |
-| RBAC | Storage Account Contributor on all source/destination resource groups |
-| `/opt/dr-sync/` | Sync script, CSV, config, and wrapper script deployed to the VM |
-| Cron job (`/etc/cron.d/dr-sync`) | Recurring schedule (default: every 12 hours) |
-| Log rotation (`/etc/logrotate.d/dr-sync`) | 14 days retention, compressed |
+| Resource | Naming Convention | Details |
+|---|---|---|
+| VM (auto-created if needed) | `{VMName}` | Linux Ubuntu 22.04 (Standard_B2s by default) |
+| OS Disk | `{VMName}-osdisk` | Managed disk for the VM |
+| NIC | `{VMName}-nic` | Network interface attached to the VM |
+| VNET / Subnet | `{VMName}-vnet` / `default` | Virtual network and subnet (or use existing with `-ExistingVNetName`) |
+| NSG | `{VMName}-nsg` | Network security group for the VM |
+| NAT Gateway | `{VMName}-natgw` | Outbound internet access (skip with `-SkipNatGateway` or when using existing VNet) |
+| Public IP | `{VMName}-natgw-pip` | Standard SKU static IP for the NAT Gateway |
+| System-Assigned Managed Identity | — | Secure auth — no credentials stored |
+| Prerequisites | — | Azure CLI, AzCopy, PowerShell 7 (auto-installed) |
+| RBAC | — | Storage Account Contributor on all source/destination resource groups |
+| `/opt/dr-sync/` | — | Sync script, CSV, config, and wrapper script deployed to the VM |
+| Cron job | `/etc/cron.d/dr-sync` | Recurring schedule (default: every 12 hours) |
+| Log rotation | `/etc/logrotate.d/dr-sync` | 14 days retention, compressed |
 
 **Files on the VM:**
 
@@ -226,6 +242,9 @@ az vm run-command invoke --name vm-dr-sync --resource-group rg-dr-sync \
 | `-VMResourceId` | No* | — | ARM Resource ID of an existing Linux VM |
 | `-VMName` | No* | — | Name for a new VM to create |
 | `-VMSize` | No | `Standard_B2s` | VM size for the new VM |
+| `-ExistingVNetName` | No | — | Name of an existing VNet to use (for Hub-Spoke). Requires `-ExistingSubnetName` |
+| `-ExistingSubnetName` | No | — | Subnet within the existing VNet. Required with `-ExistingVNetName` |
+| `-ExistingVNetResourceGroup` | No | `ResourceGroupName` | RG containing the existing VNet (set when VNet is in a different RG) |
 | `-DestSubscriptionId` | No | Source subscription | Subscription for destination storage accounts |
 | `-ScheduleIntervalHours` | No | `12` | Sync frequency in hours (1-24) |
 | `-SyncMode` | No | `Additive` | `Additive` or `Mirror` |
@@ -235,6 +254,28 @@ az vm run-command invoke --name vm-dr-sync --resource-group rg-dr-sync \
 | `-DryRun` | No | Off | Preview changes without creating anything |
 
 *Must specify exactly one of `-VMResourceId` or `-VMName`.
+
+#### Hub-Spoke / Existing VNet
+
+In enterprise environments with strict networking (Hub-Spoke topology, Azure Firewall, UDR-based routing), use `-ExistingVNetName` to place the VM into a pre-provisioned VNet instead of creating a new one:
+
+```powershell
+./Setup-SyncVM.ps1 `
+    -ResourceGroupName "rg-dr-sync" `
+    -Location "switzerlandnorth" `
+    -CsvPath "./resources.csv" `
+    -VMName "vm-dr-sync" `
+    -ExistingVNetName "spoke-dr-vnet" `
+    -ExistingSubnetName "snet-sync" `
+    -ExistingVNetResourceGroup "rg-networking" `
+    -SkipNatGateway
+```
+
+When using an existing VNet:
+- The script **verifies** the VNet and subnet exist before proceeding
+- **NAT Gateway is skipped** by default (assumes outbound is managed by your network team — e.g., Azure Firewall, UDR, or existing NAT Gateway)
+- The VM's NIC references the subnet by full ARM Resource ID, so cross-RG VNets work correctly
+- An NSG (`{VMName}-nsg`) is still created and attached to the NIC
 
 #### Updating the CSV (VM + Cron)
 

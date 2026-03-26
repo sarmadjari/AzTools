@@ -67,6 +67,22 @@
     Semicolon-delimited glob pattern passed to AzCopy --exclude-pattern.
     Example: "*.tmp;~$*;thumbs.db"
 
+.PARAMETER ExistingVNetName
+    Name of an existing Virtual Network to place the VM into. Use for Hub-Spoke
+    topologies or when the VM must join a pre-provisioned network. When set, the
+    script skips VNET/Subnet creation and uses the specified network instead.
+    Must be combined with -ExistingSubnetName. -ExistingVNetResourceGroup defaults
+    to -ResourceGroupName if omitted.
+
+.PARAMETER ExistingSubnetName
+    Name of the subnet within -ExistingVNetName. Required when -ExistingVNetName
+    is specified. The subnet must already exist.
+
+.PARAMETER ExistingVNetResourceGroup
+    Resource group that contains the existing VNet. Defaults to -ResourceGroupName
+    when omitted — set this explicitly when the VNet lives in a different RG
+    (common in Hub-Spoke deployments).
+
 .PARAMETER SkipNatGateway
     Switch. Skips NAT Gateway and Public IP creation for the new VM.
     Use when the VM subnet already has outbound internet access.
@@ -110,14 +126,27 @@
         -Location "switzerlandnorth" `
         -CsvPath ".\resources.csv" `
         -VMName "vm-dr-sync" `
+        -ExistingVNetName "hub-vnet" `
+        -ExistingSubnetName "snet-sync" `
+        -ExistingVNetResourceGroup "rg-networking" `
+        -SkipNatGateway
+
+    Creates a VM in an existing Hub-Spoke VNet (VNet in a different RG).
+
+.EXAMPLE
+    .\Setup-SyncVM.ps1 `
+        -ResourceGroupName "rg-dr-sync" `
+        -Location "switzerlandnorth" `
+        -CsvPath ".\resources.csv" `
+        -VMName "vm-dr-sync" `
         -DryRun
 
     Shows what would be created without making any changes.
 
 .NOTES
     Author  : AzTools
-    Version : 1.0
-    Date    : 2026-03-24
+    Version : 1.1
+    Date    : 2026-03-25
     Requires: Azure CLI (az), PowerShell 5.1+ (for running this setup script)
 #>
 
@@ -128,6 +157,9 @@ param (
     [Parameter(Mandatory=$false)][string]$VMResourceId,
     [Parameter(Mandatory=$false)][string]$VMName,
     [Parameter(Mandatory=$false)][string]$VMSize = "Standard_B2s",
+    [Parameter(Mandatory=$false)][string]$ExistingVNetName,
+    [Parameter(Mandatory=$false)][string]$ExistingSubnetName,
+    [Parameter(Mandatory=$false)][string]$ExistingVNetResourceGroup,
     [Parameter(Mandatory=$false)][string]$DestSubscriptionId,
     [Parameter(Mandatory=$false)][ValidateRange(1,24)][int]$ScheduleIntervalHours = 12,
     [Parameter(Mandatory=$false)][ValidateSet("Additive","Mirror")][string]$SyncMode = "Additive",
@@ -525,6 +557,21 @@ try {
         throw "Must specify either -VMResourceId (existing VM) or -VMName (create new VM)."
     }
 
+    # Validate VNet parameters
+    if ($ExistingVNetName -and -not $ExistingSubnetName) {
+        throw "-ExistingSubnetName is required when -ExistingVNetName is specified."
+    }
+    if ($ExistingSubnetName -and -not $ExistingVNetName) {
+        throw "-ExistingVNetName is required when -ExistingSubnetName is specified."
+    }
+    if ($ExistingVNetName -and $VMResourceId) {
+        throw "-ExistingVNetName cannot be used with -VMResourceId (existing VMs already have networking)."
+    }
+    if (-not $ExistingVNetResourceGroup -and $ExistingVNetName) {
+        $ExistingVNetResourceGroup = $ResourceGroupName
+        Write-Log "  -ExistingVNetResourceGroup not specified, defaulting to '$ResourceGroupName'"
+    }
+
     if (-Not (Test-Path $CsvPath)) {
         throw "CSV file not found at path: $CsvPath"
     }
@@ -644,6 +691,10 @@ try {
     Write-Log "  VM                   : $(if ($VMName) { "$VMName (new)" } else { $VMResourceId })"
     Write-Log "  Resource Group       : $ResourceGroupName"
     Write-Log "  Location             : $Location"
+    if ($ExistingVNetName) {
+        Write-Log "  VNet (existing)      : $ExistingVNetName (RG: $ExistingVNetResourceGroup)"
+        Write-Log "  Subnet               : $ExistingSubnetName"
+    }
     Write-Log "  SyncMode             : $SyncMode"
     Write-Log "  Cron Schedule        : Every $ScheduleIntervalHours hour(s) ($CronExpression)"
     if ($SyncMode -eq "Mirror") {
@@ -698,14 +749,23 @@ try {
 
         Write-Log "Creating VM '$VMNameResolved' (Linux, $VMSize)..."
 
+        # Determine networking mode
+        $UseExistingVNet = [bool]$ExistingVNetName
+
         if ($DryRun) {
             Write-Log "  [DRYRUN] Would create resource group '$ResourceGroupName' in '$Location' (if needed)" "DRYRUN"
             Write-Log "  [DRYRUN] Would create NSG '$VMNameResolved-nsg'" "DRYRUN"
-            Write-Log "  [DRYRUN] Would create VNET '$VMNameResolved-vnet'" "DRYRUN"
-            if (-not $SkipNatGateway) {
-                Write-Log "  [DRYRUN] Would create NAT Gateway '$VMNameResolved-natgw'" "DRYRUN"
+            if ($UseExistingVNet) {
+                Write-Log "  [DRYRUN] Would use existing VNET '$ExistingVNetName' (RG: $ExistingVNetResourceGroup), subnet '$ExistingSubnetName'" "DRYRUN"
             } else {
+                Write-Log "  [DRYRUN] Would create VNET '$VMNameResolved-vnet'" "DRYRUN"
+            }
+            if (-not $SkipNatGateway -and -not $UseExistingVNet) {
+                Write-Log "  [DRYRUN] Would create NAT Gateway '$VMNameResolved-natgw'" "DRYRUN"
+            } elseif ($SkipNatGateway) {
                 Write-Log "  [DRYRUN] NAT Gateway: Skipped (-SkipNatGateway)" "DRYRUN"
+            } else {
+                Write-Log "  [DRYRUN] NAT Gateway: Skipped (using existing VNet)" "DRYRUN"
             }
             Write-Log "  [DRYRUN] Would create NIC '$VMNameResolved-nic'" "DRYRUN"
             Write-Log "  [DRYRUN] Would create VM '$VMNameResolved' ($VMSize, Ubuntu 22.04)" "DRYRUN"
@@ -736,11 +796,20 @@ try {
             } else {
                 $OsDiskName   = "$VMNameResolved-osdisk"
                 $NicName      = "$VMNameResolved-nic"
-                $VNetName     = "$VMNameResolved-vnet"
                 $NSGName      = "$VMNameResolved-nsg"
                 $NatGwName    = "$VMNameResolved-natgw"
                 $NatGwPipName = "$VMNameResolved-natgw-pip"
-                $SubnetName   = "default"
+
+                # Determine VNet/Subnet names and resource group
+                if ($UseExistingVNet) {
+                    $VNetName     = $ExistingVNetName
+                    $SubnetName   = $ExistingSubnetName
+                    $VNetRG       = $ExistingVNetResourceGroup
+                } else {
+                    $VNetName     = "$VMNameResolved-vnet"
+                    $SubnetName   = "default"
+                    $VNetRG       = $ResourceGroupName
+                }
 
                 Write-Log "  Creating networking resources..."
 
@@ -757,22 +826,39 @@ try {
                     Write-Log "    NSG may already exist, continuing..." "WARN"
                 }
 
-                # VNET
-                Write-Log "    Creating VNET '$VNetName' with subnet '$SubnetName'..."
-                $VNetCreate = Invoke-AzCommand -Arguments @(
-                    "network", "vnet", "create",
-                    "--name", $VNetName,
-                    "--resource-group", $ResourceGroupName,
-                    "--location", $Location,
-                    "--subnet-name", $SubnetName,
-                    "-o", "none"
-                ) -IgnoreExitCode
-                if ($VNetCreate.ExitCode -ne 0) {
-                    Write-Log "    VNET may already exist, continuing..." "WARN"
+                # VNET — create only if not using existing
+                if ($UseExistingVNet) {
+                    Write-Log "    Using existing VNET '$VNetName' (RG: $VNetRG), subnet '$SubnetName'"
+
+                    # Verify the VNet and subnet exist
+                    $SubnetCheck = Invoke-AzCommand -Arguments @(
+                        "network", "vnet", "subnet", "show",
+                        "--name", $SubnetName,
+                        "--resource-group", $VNetRG,
+                        "--vnet-name", $VNetName,
+                        "-o", "json"
+                    ) -IgnoreExitCode
+                    if ($SubnetCheck.ExitCode -ne 0) {
+                        throw "Subnet '$SubnetName' not found in VNet '$VNetName' (RG: $VNetRG). Verify the VNet and subnet names."
+                    }
+                    Write-Log "    VNet and subnet verified." "SUCCESS"
+                } else {
+                    Write-Log "    Creating VNET '$VNetName' with subnet '$SubnetName'..."
+                    $VNetCreate = Invoke-AzCommand -Arguments @(
+                        "network", "vnet", "create",
+                        "--name", $VNetName,
+                        "--resource-group", $VNetRG,
+                        "--location", $Location,
+                        "--subnet-name", $SubnetName,
+                        "-o", "none"
+                    ) -IgnoreExitCode
+                    if ($VNetCreate.ExitCode -ne 0) {
+                        Write-Log "    VNET may already exist, continuing..." "WARN"
+                    }
                 }
 
-                # NAT Gateway
-                if (-not $SkipNatGateway) {
+                # NAT Gateway — skip when using existing VNet (assumes network team manages outbound)
+                if (-not $SkipNatGateway -and -not $UseExistingVNet) {
                     Write-Log "    Creating Public IP '$NatGwPipName' for NAT Gateway..."
                     Invoke-AzCommand -Arguments @(
                         "network", "public-ip", "create",
@@ -799,7 +885,7 @@ try {
                     $NatAssoc = Invoke-AzCommand -Arguments @(
                         "network", "vnet", "subnet", "update",
                         "--name", $SubnetName,
-                        "--resource-group", $ResourceGroupName,
+                        "--resource-group", $VNetRG,
                         "--vnet-name", $VNetName,
                         "--nat-gateway", $NatGwName,
                         "-o", "none"
@@ -807,22 +893,25 @@ try {
                     if ($NatAssoc.ExitCode -ne 0) {
                         Write-Log "    WARNING: Failed to associate NAT Gateway with subnet. VM may lack outbound internet." "WARN"
                     }
+                } elseif ($UseExistingVNet) {
+                    Write-Log "    NAT Gateway: Skipped (using existing VNet — outbound access assumed to be managed externally)."
                 } else {
                     Write-Log "    Skipping NAT Gateway (-SkipNatGateway). Ensure the VM has outbound internet access." "WARN"
                 }
 
-                # NIC
+                # NIC — reference VNet from correct RG (may differ from VM RG in Hub-Spoke)
                 Write-Log "    Creating NIC '$NicName'..."
-                Invoke-AzCommand -Arguments @(
+                $NicSubnetId = "/subscriptions/$($CurrentAccount.id)/resourceGroups/$VNetRG/providers/Microsoft.Network/virtualNetworks/$VNetName/subnets/$SubnetName"
+                $NicArgs = @(
                     "network", "nic", "create",
                     "--name", $NicName,
                     "--resource-group", $ResourceGroupName,
                     "--location", $Location,
-                    "--vnet-name", $VNetName,
-                    "--subnet", $SubnetName,
+                    "--subnet", $NicSubnetId,
                     "--network-security-group", $NSGName,
                     "-o", "none"
-                ) -IgnoreExitCode | Out-Null
+                )
+                Invoke-AzCommand -Arguments $NicArgs -IgnoreExitCode | Out-Null
 
                 # VM
                 Write-Log "  Creating VM '$VMNameResolved' (Ubuntu 22.04, $VMSize)..."
@@ -1167,6 +1256,10 @@ echo "LOGROTATE_CREATED"
     Write-Log "  VM Size                  : $VMSize"
     Write-Log "  VM MI Principal ID       : $(if ($VMPrincipalId) { $VMPrincipalId } else { '(dry-run)' })"
     Write-Log "  Location                 : $Location"
+    if ($ExistingVNetName) {
+        Write-Log "  VNet (existing)          : $ExistingVNetName (RG: $ExistingVNetResourceGroup)"
+        Write-Log "  Subnet                   : $ExistingSubnetName"
+    }
     Write-Log "  RBAC scopes              : $($UniqueRGScopes.Count) resource group(s)"
     Write-Log "  SyncMode                 : $SyncMode"
     Write-Log "  Cron Schedule            : Every ${ScheduleIntervalHours}h ($CronExpression)"

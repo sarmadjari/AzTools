@@ -59,11 +59,13 @@ Discovers and rehydrates all Archive-tier blobs in an Azure Storage Account. Des
 
 ### [Sync-DRFileShares](./Sync-DRFileShares)
 
-Contains two scripts:
+Contains three scripts:
 
 - **Sync-DRFileShares.ps1** — Syncs Azure File Shares from source to destination using `azcopy sync`. Compares source vs destination and transfers only changed files. Supports Additive (default, no deletes) and Mirror (syncs deletions) modes. Dual-mode, works both interactively and as an Azure Automation Runbook.
 
-- **Setup-SyncAutomation.ps1** — Deploys an Azure Automation Account, Hybrid Worker VM, recurring schedule, and all supporting resources to run `Sync-DRFileShares.ps1` on a configurable interval. One-command setup, auto-creates a VM if none is provided.
+- **Setup-SyncVM.ps1** (recommended) — Deploys the sync script to a Linux VM with a cron job. Simple approach — no Automation Account required. Supports creating a new VM or using an existing one, with optional Hub-Spoke networking (`-ExistingVNetName`).
+
+- **Setup-SyncAutomation.ps1** — Deploys an Azure Automation Account, Hybrid Worker VM, recurring schedule, and all supporting resources to run `Sync-DRFileShares.ps1` on a configurable interval. Use when you need centralized job history and portal integration.
 
 ## Typical Workflow
 
@@ -79,7 +81,9 @@ Contains two scripts:
 
 ```
 1. Create DR accounts    →  Create-DRFileShareAccounts.ps1 (creates accounts, shares, and copies data)
-2. Ongoing sync          →  Sync-DRFileShares.ps1 (manual or automated via Setup-SyncAutomation.ps1)
+2. Ongoing sync          →  Sync-DRFileShares.ps1 (manual)
+3. Automate (Option A)   →  Setup-SyncVM.ps1 (VM + cron — recommended)
+   Automate (Option B)   →  Setup-SyncAutomation.ps1 (Automation Account + Hybrid Worker)
 ```
 
 ## Docs
