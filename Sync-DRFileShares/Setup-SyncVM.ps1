@@ -26,9 +26,13 @@
 
 .PARAMETER ResourceGroupName
     Resource group for the VM. Created if it does not exist.
+    Required when creating a new VM (-VMName). When using -VMResourceId,
+    defaults to the VM's resource group if not specified.
 
 .PARAMETER Location
     Azure region (e.g., "switzerlandnorth").
+    Required when creating a new VM (-VMName). When using -VMResourceId,
+    auto-detected from the VM if not specified.
 
 .PARAMETER CsvPath
     Path to the CSV mapping file with headers:
@@ -101,12 +105,11 @@
 
 .EXAMPLE
     .\Setup-SyncVM.ps1 `
-        -ResourceGroupName "rg-dr-sync" `
-        -Location "switzerlandnorth" `
         -CsvPath ".\resources.csv" `
         -VMResourceId "/subscriptions/.../virtualMachines/vm-existing"
 
-    Uses an existing VM for sync automation.
+    Uses an existing VM. ResourceGroupName and Location are auto-detected
+    from the VM Resource ID.
 
 .EXAMPLE
     .\Setup-SyncVM.ps1 `
@@ -145,14 +148,14 @@
 
 .NOTES
     Author  : AzTools
-    Version : 1.1
-    Date    : 2026-03-25
+    Version : 1.2
+    Date    : 2026-04-01
     Requires: Azure CLI (az), PowerShell 5.1+ (for running this setup script)
 #>
 
 param (
-    [Parameter(Mandatory=$true)][string]$ResourceGroupName,
-    [Parameter(Mandatory=$true)][string]$Location,
+    [Parameter(Mandatory=$false)][string]$ResourceGroupName,
+    [Parameter(Mandatory=$false)][string]$Location,
     [Parameter(Mandatory=$true)][string]$CsvPath,
     [Parameter(Mandatory=$false)][string]$VMResourceId,
     [Parameter(Mandatory=$false)][string]$VMName,
@@ -557,6 +560,45 @@ try {
         throw "Must specify either -VMResourceId (existing VM) or -VMName (create new VM)."
     }
 
+    # When using existing VM, parse Resource ID early and derive defaults
+    if ($VMResourceId) {
+        if ($VMResourceId -notmatch "(?i)^/subscriptions/([^/]+)/resourceGroups/([^/]+)/providers/Microsoft\.Compute/virtualMachines/([^/]+)$") {
+            throw "Invalid VM ARM Resource ID format: $VMResourceId. Expected: /subscriptions/{sub}/resourceGroups/{rg}/providers/Microsoft.Compute/virtualMachines/{name}"
+        }
+        $VMSubId = $Matches[1]
+        $VMRGResolved = $Matches[2]
+        $VMNameResolved = $Matches[3]
+
+        if (-not $ResourceGroupName) {
+            $ResourceGroupName = $VMRGResolved
+            Write-Log "  -ResourceGroupName not provided, derived from VM Resource ID: '$ResourceGroupName'"
+        }
+
+        if (-not $Location) {
+            $VMLocQuery = Invoke-AzCommand -Arguments @(
+                "vm", "show", "--name", $VMNameResolved, "--resource-group", $VMRGResolved,
+                "--query", "location", "-o", "tsv"
+            ) -IgnoreExitCode
+            if ($VMLocQuery.ExitCode -eq 0 -and $VMLocQuery.StdOut.Trim()) {
+                $Location = $VMLocQuery.StdOut.Trim()
+                Write-Log "  -Location not provided, detected from VM: '$Location'"
+            } else {
+                Write-Log "  WARNING: Could not detect VM location. Specify -Location explicitly for accurate reporting." "WARN"
+                $Location = "(unknown)"
+            }
+        }
+    }
+
+    # ResourceGroupName and Location are required when creating a new VM
+    if ($VMName) {
+        if (-not $ResourceGroupName) {
+            throw "-ResourceGroupName is required when creating a new VM with -VMName."
+        }
+        if (-not $Location) {
+            throw "-Location is required when creating a new VM with -VMName."
+        }
+    }
+
     # Validate VNet parameters
     if ($ExistingVNetName -and -not $ExistingSubnetName) {
         throw "-ExistingSubnetName is required when -ExistingVNetName is specified."
@@ -705,19 +747,11 @@ try {
     # ── Step 3: Create or verify VM ───────────────────────────────
     $VMPrincipalId = $null
     $VMCreatedByScript = $false
-    $VMNameResolved = $null
-    $VMRGResolved = $null
 
     if ($VMResourceId) {
         # ── Path A: Use existing VM ──
-        Write-Log "Setting up sync on existing VM..."
-
-        if ($VMResourceId -notmatch "(?i)^/subscriptions/([^/]+)/resourceGroups/([^/]+)/providers/Microsoft\.Compute/virtualMachines/([^/]+)$") {
-            throw "Invalid VM ARM Resource ID format: $VMResourceId. Expected: /subscriptions/{sub}/resourceGroups/{rg}/providers/Microsoft.Compute/virtualMachines/{name}"
-        }
-        $VMSubId = $Matches[1]
-        $VMRGResolved = $Matches[2]
-        $VMNameResolved = $Matches[3]
+        # VMSubId, VMRGResolved, VMNameResolved already parsed in Step 1
+        Write-Log "Setting up sync on existing VM '$VMNameResolved' (RG: $VMRGResolved)..."
 
         if (-not $DryRun) {
             # Verify VM exists and is Linux
